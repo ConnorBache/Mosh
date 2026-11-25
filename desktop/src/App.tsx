@@ -4,8 +4,9 @@ import { ArrowLeft, ArrowRight, ArrowUpRight, Bookmark, ChevronRight, Clock3, Da
 import { bytes, displayDate, leaf, ledger, type Details, type LedgerObject, type Saved } from './ledger'
 import { Cleave, Collections, Disk, History, Inspector, TagExplorer } from './Views'
 import { Agents, Ask, Settings, TagRegistry } from './Intelligence'
+import { Scopes } from './Scopes'
 
-const navigation = [['Explorer', Folder], ['Ask Mosh', Search], ['Tags', Tags], ['Collections', Network], ['Disk usage', HardDrive], ['Cleave', Layers3], ['History', Clock3], ['Agents', Database], ['Settings', ListFilter]] as const
+const navigation = [['Explorer', Folder], ['Ask Mosh', Search], ['Tags', Tags], ['Collections', Network], ['Nested Moshes', Database], ['Disk usage', HardDrive], ['Cleave', Layers3], ['History', Clock3], ['Agents', Database], ['Settings', ListFilter]] as const
 type View = typeof navigation[number][0]
 export interface Field { title: string; label: string; apply: (text: string) => Promise<void> }
 export type Task = <T>(name: string, action: () => Promise<T>) => Promise<T | undefined>
@@ -13,6 +14,7 @@ const limit = 100
 
 export function App() {
   const [view, setView] = useState<View>('Explorer')
+  const [scopeChild, setScopeChild] = useState('')
   const [roots, setRoots] = useState<string[]>([])
   const [saved, setSaved] = useState<Saved[]>([])
   const [trail, setTrail] = useState<LedgerObject[]>([])
@@ -172,10 +174,12 @@ export function App() {
       </div>}
       {view === 'Tags' && <><TagExplorer generation={generation} search={search} fail={fail} /><TagRegistry fail={fail} /></>}
       {view === 'Collections' && <Collections generation={generation} refresh={refresh} browse={(object) => browse(object, true)} field={setField} fail={fail} />}
+      {view === 'Nested Moshes' && <Scopes initialChild={scopeChild} refresh={refresh} fail={fail} />}
       {view === 'Disk usage' && <Disk roots={roots} initial={physicalRoot} task={task} busy={!!working} fail={fail} />}
       {view === 'Cleave' && <Cleave initial={query} marked={marked} refresh={refresh} task={task} busy={!!working} />}
       {view === 'History' && <History generation={generation} fail={fail} />}
-      {view === 'Ask Mosh' && <Ask fail={fail} reveal={object => { search(''); setFocused(object) }} />}
+      {view === 'Ask Mosh' && <Ask fail={fail} reveal={object => { search(''); setFocused(object) }}
+        route={child => { setScopeChild(child); setView('Nested Moshes') }} />}
       {view === 'Agents' && <Agents fail={fail} />}
       {view === 'Settings' && <Settings fail={fail} />}
     </main>

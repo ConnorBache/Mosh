@@ -42,8 +42,9 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path release
+          $version = (Get-Content desktop/src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
           Copy-Item target/release/bundle/nsis/*-setup.exe release/
-          Compress-Archive -LiteralPath target/release/mosh.exe,README.md -DestinationPath release/Mosh-cli-windows-x64.zip
+          Compress-Archive -LiteralPath target/release/mosh.exe,README.md,docs/release-preview.md -DestinationPath "release/Mosh-$version-cli-windows-x64.zip"
           Get-ChildItem release -File | ForEach-Object {
             $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
             "$hash  $($_.Name)"
@@ -56,10 +57,16 @@ jobs:
       - name: Install on a clean runner and exercise the real desktop
         if: github.event_name == 'workflow_dispatch' && inputs.desktop_smoke
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           $installer = Get-ChildItem release/*-setup.exe | Select-Object -First 1
           if (-not $installer) { throw 'NSIS installer missing' }
-          $installDir = Join-Path $env:RUNNER_TEMP 'MoshSmoke'
-          $process = Start-Process -FilePath $installer.FullName -ArgumentList '/S',"/D=$installDir" -Wait -PassThru -WindowStyle Hidden
-          if ($process.ExitCode -ne 0) { throw "Installer exited $($process.ExitCode)" }
-          node desktop/tests/smoke.mjs "$installDir/mosh-desktop.exe" target/release/mosh.exe
+          $previous = Join-Path $env:RUNNER_TEMP 'MoshPrior'
+          gh release download v0.1.0 --repo "${{ github.repository }}" --dir $previous --pattern Mosh-cli-windows-x64.zip --pattern SHA256SUMS.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Could not download the published upgrade fixture CLI' }
+          $zip = Join-Path $previous 'Mosh-cli-windows-x64.zip'
+          $expected = ((Get-Content (Join-Path $previous 'SHA256SUMS.txt')) | Where-Object { $_ -match 'Mosh-cli-windows-x64\.zip$' }) -split '\s+' | Select-Object -First 1
+          if (-not $expected -or (Get-FileHash -LiteralPath $zip).Hash -ne $expected) { throw 'Prior release checksum mismatch' }
+          Expand-Archive -LiteralPath $zip -DestinationPath $previous
+          node desktop/tests/install-smoke.mjs $installer.FullName target/release/mosh.exe (Join-Path $previous 'mosh.exe')

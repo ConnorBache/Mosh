@@ -7,14 +7,15 @@ pub(crate) const AUTHORITY: &str = "WITH RECURSIVE authority(person) AS (
     SELECT ?1 UNION ALL SELECT p.id FROM people p JOIN authority a ON p.superior=a.person
 ) ";
 
-pub(crate) const VISIBLE: &str = "(?1='local' OR NOT EXISTS(
+pub(crate) const VISIBLE: &str = "(NOT EXISTS(SELECT 1 FROM nested_moshes boundary
+    WHERE o.path IS NOT NULL AND mosh_within_path(o.path,boundary.root)) AND (?1='local' OR NOT EXISTS(
     SELECT 1 FROM objects s WHERE s.secret=1 AND s.missing=0
     AND (s.id=o.id OR (s.path IS NOT NULL AND o.path IS NOT NULL AND
         substr(o.path,1,length(rtrim(s.path,?2))+1)=rtrim(s.path,?2)||?2))
     AND NOT EXISTS(SELECT 1 FROM owners w JOIN authority a ON a.person=w.person WHERE w.object=s.id)
     AND NOT EXISTS(SELECT 1 FROM guests g WHERE g.object=s.id AND g.person=?1)
     AND NOT EXISTS(SELECT 1 FROM guest_rights g WHERE g.object=s.id AND g.person=?1 AND g.right='discover')
-))";
+)))";
 
 pub(crate) fn tag_name(name: &str) -> Result<String> {
     let normalized = name.trim().to_lowercase();
@@ -51,9 +52,6 @@ pub(crate) fn dictionary_id(db: &Connection, name: &str) -> Result<i64> {
 
 impl Mosh {
     pub(crate) fn can_read(&self, selected: &Object) -> Result<bool> {
-        if self.actor == "local" {
-            return Ok(true);
-        }
         let sql = format!("{AUTHORITY} SELECT {VISIBLE} FROM objects o WHERE id=?3");
         Ok(self.db.query_row(
             &sql,

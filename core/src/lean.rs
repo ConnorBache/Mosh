@@ -135,6 +135,15 @@ pub(crate) fn resolve(db: &Connection, reference: &str) -> Result<Option<String>
 
 pub(crate) fn register(db: &Connection) -> Result<()> {
     let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC;
+    db.create_scalar_function(
+        "mosh_path_key",
+        1,
+        flags | FunctionFlags::SQLITE_INNOCUOUS,
+        |ctx| {
+            let path: Option<String> = ctx.get(0)?;
+            Ok(path.map(|path| blake3::hash(path.as_bytes()).as_bytes()[..8].to_vec()))
+        },
+    )?;
     db.create_scalar_function("mosh_object_id", 1, flags, |ctx| {
         Ok(encode_key(ctx.get::<i64>(0)? as u64))
     })?;

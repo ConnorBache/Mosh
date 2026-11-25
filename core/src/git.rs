@@ -120,7 +120,8 @@ pub(crate) fn refresh(db: &Connection, repo: &Path) -> Result<()> {
     )?;
     let tracked = read(repo, &["ls-files", "-z", "--cached"])?;
     let mut set = db.prepare_cached(
-        "UPDATE objects SET git_status=? WHERE path=? AND missing=0 AND git_root=?",
+        "UPDATE objects SET git_status=?1 WHERE path=?2 AND path IS NOT NULL AND missing=0
+            AND mosh_path_key(path)=mosh_path_key(?2) AND git_root=?3",
     )?;
     for item in tracked.split(|c| *c == 0).filter(|item| !item.is_empty()) {
         if let Ok(path) = std::str::from_utf8(item) {
@@ -180,7 +181,8 @@ pub(crate) fn refresh(db: &Connection, repo: &Path) -> Result<()> {
         ],
     )
     .unwrap_or_default();
-    let mut update=db.prepare_cached("UPDATE objects SET git_author=?1,git_committed=?2 WHERE path=?3 AND git_root=?4 AND git_author IS NULL AND missing=0")?;
+    let mut update=db.prepare_cached("UPDATE objects SET git_author=?1,git_committed=?2 WHERE path=?3 AND path IS NOT NULL
+        AND mosh_path_key(path)=mosh_path_key(?3) AND git_root=?4 AND git_author IS NULL AND missing=0")?;
     for record in data.split(|c| *c == 0x1e) {
         let Ok(record) = std::str::from_utf8(record) else {
             continue;

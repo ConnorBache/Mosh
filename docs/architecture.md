@@ -14,6 +14,14 @@ The Ledger indexes names, paths, and Paint without duplicating their text into t
 
 The object registry assigns durable integer keys for packed lookups. The API uses a short, Ledger-local base-62 spelling of the key. Previously issued UUIDs remain usable through a compact alias table. Tag names and aliases resolve through the global tag dictionary.
 
+## Storage floor and tradeoffs
+
+NTFS already stores names, directory relationships, allocation, timestamps, and native IDs. A minimal supplemental row can be modeled as a small local ID and parent key, a 12–16 byte basename, a 16-byte native ID for rename detection, a small change stamp, and a packed tag reference. On this workload that is roughly 40–60 raw bytes before SQLite record and page overhead. That model assumes the application can obtain full paths and metadata from the filesystem and has no cross-directory search indexes, offline listings, tier scores, or history. It is a design estimate.
+
+The previous Ledger copied the full path into its exact-path index. The current index stores an eight-byte key and still compares the full path before accepting a match, including in uniqueness checks. The directory index also drops the repeated logical ID. The Git index covers rows with Git metadata, and tier reads use their object-key index. Rebuildable name and path postings remain for phrase search. Routine scan activity and durable actions share an audit table, so the storage report attributes that table as one group and separately counts each event class.
+
+The file record still contains one full path. Reconstructing it from directory keys would need a coordinated migration of filesystem operations, boundary checks, and path filters. Dropping name and path postings would remove indexed phrase search. These are the largest remaining fixed-cost candidates. The preview retains those behaviors and reports their measured cost.
+
 Identical tag sets share an immutable packed record. Mosh chooses among gap-encoded IDs and runs of consecutive IDs. Origin flags retain independent sources and can share a default value for the set. Confidence and evidence departures from the defaults occupy a sparse table.
 
 Reverse lookups group 4,096 object keys at a time and choose the smallest delta list, run list, 512-byte bitmap, or full-block marker. Confirmed and suggested memberships have independent blocks. Intersections of direct tag filters combine blocks before enumerating objects. Inherited queries expand through physical parents.

@@ -98,30 +98,83 @@ fn tokenize(query: &str) -> Result<Vec<Token>> {
     Ok(tokens)
 }
 
-pub(crate) fn explicit_tag_terms(input: &str) -> (Vec<(String, String)>, bool) {
+pub(crate) fn explicit_filters(input: &str) -> Result<(Vec<(String, String)>, String, bool)> {
     let Ok(tokens) = tokenize(input) else {
-        return (Vec::new(), false);
+        return Ok((Vec::new(), String::new(), false));
     };
     let composite = tokens
         .iter()
         .any(|token| matches!(token, Token::Or | Token::Not));
-    let terms = tokens
-        .into_iter()
+    let fields = |term: &str| {
+        let (field, _) = term.split_once(':')?;
+        matches!(
+            field,
+            "tag"
+                | "direct-tag"
+                | "inherited-tag"
+                | "suggested-tag"
+                | "name"
+                | "name-contains"
+                | "path"
+                | "id"
+                | "ext"
+                | "extension"
+                | "kind"
+                | "virtual"
+                | "type"
+                | "mime"
+                | "in"
+                | "modified"
+                | "created"
+                | "size"
+                | "allocated"
+                | "duplicate"
+                | "hash"
+                | "repo"
+                | "branch"
+                | "git-status"
+                | "git-author"
+                | "marriage"
+                | "logical-parent"
+                | "content"
+                | "indexed-content"
+                | "paint"
+                | "text"
+        )
+        .then_some(())
+    };
+    let terms: Vec<(String, String)> = tokens
+        .iter()
         .filter_map(|token| {
             let Token::Term(term) = token else {
                 return None;
             };
+            fields(term)?;
             let (field, value) = term.split_once(':')?;
-            if !matches!(
-                field,
-                "tag" | "direct-tag" | "inherited-tag" | "suggested-tag"
-            ) {
-                return None;
-            }
-            Some((field.to_owned(), tag_name(value).ok()?))
+            Some((field.to_owned(), value.to_owned()))
         })
         .collect();
-    (terms, composite)
+    if terms.is_empty() {
+        return Ok((terms, String::new(), composite));
+    }
+    let required = if composite {
+        ensure!(
+            tokens.iter().all(|token| match token {
+                Token::Term(term) => fields(term).is_some(),
+                _ => true,
+            }),
+            "use a complete Ledger expression for Boolean filters"
+        );
+        input.to_owned()
+    } else {
+        terms
+            .iter()
+            .map(|(field, value)| format!("{field}:\"{}\"", value.replace('"', "\\\"")))
+            .collect::<Vec<_>>()
+            .join(" AND ")
+    };
+    validate(&required)?;
+    Ok((terms, required, composite))
 }
 
 struct Parser {

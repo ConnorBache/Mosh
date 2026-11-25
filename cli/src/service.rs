@@ -50,9 +50,14 @@ async fn request(
             | "graph"
             | "saved"
             | "tier"
+            | "individuality"
+            | "vocabulary_advice"
             | "passages"
             | "ask"
             | "feedback"
+            | "mosh_info"
+            | "mosh_route"
+            | "mosh_handoff"
     ) {
         return (
             StatusCode::NOT_FOUND,

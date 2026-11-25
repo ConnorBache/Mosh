@@ -6,7 +6,8 @@ type TierRule = { level: number; minimum_tags: number; minimum_score: number; pa
 type TierSettings = { tiers: TierRule[]; weights: { importance: number; information: number; hotness: number; promote: boolean; demote: boolean; hysteresis: number } }
 type Config = Record<string, string | boolean | number | string[] | null>
 type Finding = { object: LedgerObject; why: string[]; excerpt: string | null; certainty: string; citation: { id: number } | null }
-type SearchRun = { id: number | null; results: Finding[]; answer: string | null; metrics: { total_ms: number }; notes: string[] }
+type SearchRun = { id: number | null; results: Finding[]; answer: string | null; metrics: { total_ms: number }; notes: string[];
+  child_suggestions: { child: string; name: string; paint: string }[] }
 
 const textSettings: Record<string, string> = {
   endpoint: 'Endpoint', classification: 'Classification model', embedding: 'Embedding model', reasoning: 'Reasoning model',
@@ -104,7 +105,7 @@ export function Settings({ fail }: { fail: Fail }) {
   </section>
 }
 
-export function Ask({ fail, reveal }: { fail: Fail; reveal: (item: LedgerObject) => void }) {
+export function Ask({ fail, reveal, route }: { fail: Fail; reveal: (item: LedgerObject) => void; route: (child: string) => void }) {
   const [question, setQuestion] = useState('')
   const [answer, setAnswer] = useState(true)
   const [result, setResult] = useState<SearchRun | null>(null)
@@ -123,6 +124,9 @@ export function Ask({ fail, reveal }: { fail: Fail; reveal: (item: LedgerObject)
     {result && <><p>{result.results.length.toLocaleString()} results in {result.metrics.total_ms.toLocaleString()} ms</p>
       {result.answer && <blockquote>{result.answer}</blockquote>}
       {result.notes.map(note => <p className="muted" key={note}>{note}</p>)}
+      {result.child_suggestions.map(pointer => <p key={pointer.child}>
+        <button className="secondary" onClick={() => route(pointer.child)}>Inspect child {pointer.name}</button> {pointer.paint}
+      </p>)}
       {result.results.map(item => <article className="inspect-block" key={item.object.id}>
         <button className="secondary" onClick={() => reveal(item.object)}>{item.object.name}</button>
         <p className="muted">{item.certainty === 'verified-excerpt' ? 'Verified source excerpt' : item.certainty === 'approximate' ? 'Approximate match' : 'Candidate'} · {item.why.join(' · ')}</p>
@@ -209,7 +213,7 @@ export function TagRegistry({ fail }: { fail: Fail }) {
         <button className="secondary" key={action} disabled={!tag.trim()} onClick={() => run('maintain_tag', { action, category: category || null, description: description || null, replacement: into || null })}>{action}</button>)}
       {['alias', 'rename', 'merge'].map(action =>
         <button className="secondary" key={action} disabled={!tag.trim() || !into.trim()} onClick={() => {
-          if (action !== 'merge' || window.confirm(`Merge every assignment of ${tag} into ${into}?`)) run('tag_dictionary', { action })
+          if (action !== 'merge' || window.confirm(`Merge every assignment of ${tag} into ${into}?`)) run('tag_dictionary', { action, confirmed: action === 'merge' })
         }}>{action}</button>)}
       <button className="secondary" disabled={!tag.trim() || !into.trim() || !query.trim()} onClick={() => {
         ledger('tag_split', { tag, into, query, confirmed: false }).then(preview => { setResult(preview); setReviewed(true) }).catch(fail)

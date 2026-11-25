@@ -5,9 +5,10 @@ import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { once } from 'node:events'
+import { DatabaseSync } from 'node:sqlite'
 import { chromium } from 'playwright-core'
 
-const [application, cli] = process.argv.slice(2).map((path) => resolve(path))
+const [application, cli, legacy] = process.argv.slice(2).map((path) => resolve(path))
 assert(application && cli, 'Pass the installed desktop executable and the CLI executable')
 const fixture = await mkdtemp(join(tmpdir(), 'mosh-desktop-test-'))
 const root = join(fixture, 'Sample workspace')
@@ -16,9 +17,20 @@ await mkdir(root)
 await mkdir(join(root, 'Archive'))
 await writeFile(join(root, 'Orbit.md'), 'A test report about lunar navigation.')
 await writeFile(join(root, 'Copy.md'), 'A test report about lunar navigation.')
-await writeFile(join(root, 'Archive', 'Notes.txt'), 'Research notes about altitude.')
-execFileSync(cli, ['--db', db, 'scan', root], { windowsHide: true })
-execFileSync(cli, ['--db', db, 'tag', 'add', join(root, 'Orbit.md'), 'space-research'], { windowsHide: true })
+await writeFile(join(root, 'Archive', 'Notes.txt'), 'A résumé about altitude.')
+const oldDb = legacy ? join(fixture, 'old-source.sqlite3') : db
+execFileSync(legacy ?? cli, ['--db', oldDb, 'scan', root], { windowsHide: true })
+execFileSync(legacy ?? cli, ['--db', oldDb, 'tag', 'add', join(root, 'Orbit.md'), 'space-research'], { windowsHide: true })
+const version = (path) => {
+  const sqlite = new DatabaseSync(path, { readOnly: true })
+  try { return sqlite.prepare('PRAGMA user_version').get().user_version }
+  finally { sqlite.close() }
+}
+if (legacy) {
+  assert.equal(version(oldDb), 1)
+  execFileSync(legacy, ['--db', oldDb, 'backup', db], { windowsHide: true })
+  assert.equal(version(db), 1)
+}
 
 const server = createServer()
 server.listen(0, '127.0.0.1')
@@ -53,9 +65,15 @@ try {
   const nav = (name) => page.getByRole('navigation', { name: 'Workspace' }).getByRole('button', { name, exact: true })
   await page.locator('.sidebar').getByRole('button', { name: 'Sample workspace', exact: true }).click()
   await page.getByRole('heading', { name: 'Sample workspace' }).waitFor()
+  if (legacy) {
+    assert.equal(version(db), 7)
+    assert.equal(version(oldDb), 1)
+  }
   await page.getByRole('button', { name: 'Orbit.md', exact: true }).click()
   const inspector = page.getByRole('complementary', { name: 'Metadata inspector' })
   await inspector.getByText('space-research', { exact: true }).waitFor()
+  await inspector.getByRole('button', { name: 'Individuality', exact: true }).click()
+  await inspector.getByRole('button', { name: 'Review vocabulary', exact: true }).waitFor()
   await inspector.getByRole('button', { name: 'Preview', exact: true }).click()
   await inspector.getByText('A test report about lunar navigation.').waitFor()
   await inspector.getByRole('button', { name: 'Details', exact: true }).click()
@@ -69,6 +87,9 @@ try {
   await search.press('Enter')
   await page.getByRole('heading', { name: 'Search results' }).waitFor()
   await page.getByRole('button', { name: 'Orbit.md', exact: true }).waitFor()
+  await search.fill('content:resume')
+  await search.press('Enter')
+  await page.getByRole('button', { name: 'Notes.txt', exact: true }).waitFor()
 
   await nav('Tags').click()
   await page.getByRole('heading', { name: 'Tag Explorer' }).waitFor()
@@ -90,6 +111,8 @@ try {
 
   await nav('Disk usage').click()
   await page.getByRole('heading', { name: 'Storage by location' }).waitFor()
+  await page.getByRole('button', { name: 'Measure Ledger' }).click()
+  await page.getByText('file records', { exact: true }).waitFor()
   await page.getByRole('button', { name: 'Find duplicates' }).click()
   await page.getByText('2 paths · 2 files', { exact: false }).waitFor()
 
@@ -125,7 +148,24 @@ try {
   await page.getByRole('textbox', { name: 'What are you looking for?' }).fill('Find Orbit')
   await page.locator('.intel').getByRole('button', { name: 'Search', exact: true }).click()
   await page.getByRole('button', { name: 'Orbit.md', exact: true }).waitFor()
-  console.log('Windows desktop smoke test passed for Explorer, Paint, Tags, Collections, disk usage, Cleave undo, History, tier settings, Agents, and Ask Mosh.')
+  const childRoot = join(root, 'Telemetry')
+  const childDb = join(fixture, 'child.sqlite3')
+  await mkdir(childRoot)
+  await writeFile(join(childRoot, 'child-scope.txt'), 'Generated sensor calibration fixture.')
+  const call = (ledgerPath, args) => JSON.parse(execFileSync(cli, ['--db', ledgerPath, ...args], { windowsHide: true, encoding: 'utf8' }))
+  call(childDb, ['scan', childRoot])
+  call(childDb, ['scope', 'allow', call(db, ['scope', 'info']).mosh, 'local'])
+  await nav('Nested Moshes').click()
+  await page.getByLabel('Child Ledger path').fill(childDb)
+  await page.getByLabel('Child root directory').fill(childRoot)
+  await page.getByLabel('Display name').fill('Telemetry child')
+  await page.getByRole('button', { name: 'Attach child', exact: true }).click()
+  await page.getByRole('button', { name: 'Telemetry child', exact: true }).click()
+  await page.getByLabel('Search this child').fill('name:child-scope.txt')
+  await page.getByRole('button', { name: 'Search child', exact: true }).click()
+  await page.getByText('child-scope.txt', { exact: true }).waitFor()
+  assert.equal(call(db, ['search', 'name:child-scope.txt']).length, 0)
+  console.log(`Windows desktop scope, Individuality, and filesystem smoke passed${legacy ? ' on an upgraded format 1 copy' : ''}.`)
 } finally {
   await browser?.close().catch(() => {})
   if (app.exitCode === null) {

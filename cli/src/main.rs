@@ -40,6 +40,17 @@ enum Command {
         #[arg(long, default_value = "{}")]
         json: String,
     },
+    /// Compare the file's confirmed tags against its nearest permitted neighbors.
+    Individuality {
+        reference: String,
+    },
+    /// Register, inspect, and explicitly search nested Moshes.
+    Scope {
+        #[arg(long)]
+        actor: Option<String>,
+        #[command(subcommand)]
+        action: ScopeCommand,
+    },
     Init,
     Scan {
         path: PathBuf,
@@ -176,6 +187,47 @@ enum Command {
     },
 }
 
+#[derive(Subcommand)]
+enum ScopeCommand {
+    Info,
+    Attach {
+        attachment: PathBuf,
+        root: PathBuf,
+        name: String,
+        #[arg(long, default_value = "")]
+        paint: String,
+        #[arg(long)]
+        tag: Vec<String>,
+    },
+    Detach {
+        child: String,
+    },
+    Route {
+        #[arg(default_value = "")]
+        query: String,
+        #[arg(long)]
+        child: Option<String>,
+    },
+    Discover {
+        child: String,
+        person: String,
+        #[arg(long)]
+        revoke: bool,
+    },
+    Allow {
+        parent: String,
+        person: String,
+        #[arg(long)]
+        revoke: bool,
+    },
+    Handoff {
+        child: String,
+        query: String,
+        #[arg(long)]
+        natural: bool,
+    },
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum SortBy {
     Name,
@@ -236,9 +288,13 @@ enum TagCommand {
     Merge {
         from: String,
         into: String,
+        #[arg(long)]
+        confirm: bool,
     },
     Delete {
         tag: String,
+        #[arg(long)]
+        confirm: bool,
     },
     Rule {
         query: String,
@@ -371,11 +427,23 @@ fn run(cli: Cli) -> Result<Option<Value>> {
                     mosh.tag_dictionary("rename", &tag, Some(&name))?;
                     ok
                 }
-                TagCommand::Merge { from, into } => {
+                TagCommand::Merge {
+                    from,
+                    into,
+                    confirm,
+                } => {
+                    ensure!(
+                        confirm,
+                        "use --confirm after reviewing the affected assignments"
+                    );
                     mosh.tag_dictionary("merge", &from, Some(&into))?;
                     ok
                 }
-                TagCommand::Delete { tag } => {
+                TagCommand::Delete { tag, confirm } => {
+                    ensure!(
+                        confirm,
+                        "use --confirm after reviewing the affected assignments"
+                    );
                     mosh.tag_dictionary("delete", &tag, None)?;
                     ok
                 }
@@ -500,6 +568,45 @@ fn run(cli: Cli) -> Result<Option<Value>> {
             }
             Command::Doctor => mosh.doctor()?,
             Command::Ask { request, answer } => mosh.ask(&request, answer)?,
+            Command::Individuality { reference } => mosh.individuality(&reference)?,
+            Command::Scope { actor, action } => {
+                let guest = actor
+                    .as_deref()
+                    .map(|actor| Mosh::as_actor(mosh.db_path(), actor))
+                    .transpose()?;
+                let scope = guest.as_ref().unwrap_or(&mosh);
+                match action {
+                    ScopeCommand::Info => {
+                        json!({"mosh":scope.mosh_id()?,"children":scope.child_pointers("",None)?})
+                    }
+                    ScopeCommand::Attach {
+                        attachment,
+                        root,
+                        name,
+                        paint,
+                        tag,
+                    } => scope.register_child(&attachment, &root, &name, &paint, &tag)?,
+                    ScopeCommand::Detach { child } => scope.detach_child(&child)?,
+                    ScopeCommand::Route { query, child } => {
+                        json!(scope.child_pointers(&query, child.as_deref())?)
+                    }
+                    ScopeCommand::Discover {
+                        child,
+                        person,
+                        revoke,
+                    } => scope.child_discovery(&child, &person, !revoke)?,
+                    ScopeCommand::Allow {
+                        parent,
+                        person,
+                        revoke,
+                    } => scope.grant_handoff(&parent, &person, !revoke)?,
+                    ScopeCommand::Handoff {
+                        child,
+                        query,
+                        natural,
+                    } => scope.child_handoff(&child, &query, natural)?,
+                }
+            }
             Command::Intelligence { command, json } => {
                 let cancel = on_interrupt()?;
                 mosh.command(&command, &serde_json::from_str(&json)?, &cancel)?

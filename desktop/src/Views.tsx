@@ -7,6 +7,10 @@ import {
 } from './ledger'
 
 type Fail = (error: unknown) => void
+type Individuality = { score: number | null; reason: string; recommended_target: number | null;
+  nearest: { id: string; name: string; overlap: number; verified_content_duplicate: boolean }[];
+  signals: { tag: string; sampled_or_indexed_frequency: number }[] }
+type Vocabulary = { recommendation: string; proposals: { tag: string; evidence: { file: string; evidence: string }[] }[] }
 
 export function Inspector({ item, generation, refresh, fail, close, show }: {
   item: LedgerObject; generation: number; refresh: () => void; fail: Fail; close: () => void; show: () => void
@@ -23,6 +27,8 @@ export function Inspector({ item, generation, refresh, fail, close, show }: {
   const [history, setHistory] = useState<Activity[]>([])
   const [commits, setCommits] = useState<Commit[]>([])
   const [diff, setDiff] = useState('')
+  const [individuality, setIndividuality] = useState<Individuality | null>(null)
+  const [vocabulary, setVocabulary] = useState<Vocabulary | null>(null)
   const reference = item.id
 
   useEffect(() => {
@@ -35,6 +41,7 @@ export function Inspector({ item, generation, refresh, fail, close, show }: {
 
   useEffect(() => {
     if (tab === 'Preview') ledger<string>('preview', { reference }).then(setPreview).catch(fail)
+    if (tab === 'Individuality') ledger<Individuality>('individuality', { reference }).then(setIndividuality).catch(fail)
     if (tab === 'History') {
       ledger<Activity[]>('history', { reference, limit: 50 }).then(setHistory).catch(fail)
       if (item.git_root) ledger<Commit[]>('git_history', { reference }).then(setCommits).catch(fail)
@@ -46,7 +53,7 @@ export function Inspector({ item, generation, refresh, fail, close, show }: {
   return <aside className="inspector" aria-label="Metadata inspector">
     <div className="inspector-head"><ObjectIcon item={object} /><button className="icon-button" aria-label="Close inspector" onClick={close}><X size={18} /></button></div>
     <h2>{object.name}</h2><p className="path">{object.path ?? 'Virtual collection'}</p><OpenButton item={object} show={show} />
-    <div className="tabs">{['Details', 'Preview', 'History'].map((name) =>
+    <div className="tabs">{['Details', ...(item.kind === 'file' ? ['Individuality'] : []), 'Preview', 'History'].map((name) =>
       <button key={name} className={tab === name ? 'current' : ''} onClick={() => setTab(name)}>{name}</button>)}</div>
     {tab === 'Details' && <>
       <dl className="metadata"><dt>Kind</dt><dd>{object.kind === 'file' ? object.mime ?? 'File' : object.kind === 'coll' ? 'Coll' : 'Marriage'}</dd>
@@ -93,6 +100,26 @@ export function Inspector({ item, generation, refresh, fail, close, show }: {
         <pre>{JSON.stringify({ ...object, owners: detail?.owners, windows_security: detail?.windows_security }, null, 2)}</pre></details>
     </>}
     {tab === 'Preview' && (preview ? <pre className="preview">{preview}</pre> : <p className="muted">No text preview is available.</p>)}
+    {tab === 'Individuality' && individuality && <section className="inspect-block">
+      <h3>{individuality.score == null ? 'Score unavailable' : `${individuality.score} / 100`}</h3>
+      <p>{individuality.reason}</p>
+      {individuality.recommended_target && <p>Suggested target T{individuality.recommended_target}</p>}
+      {individuality.signals.length > 0 && <><h3>Distinguishing tags</h3>
+        <ul>{individuality.signals.map(signal => <li key={signal.tag}>{signal.tag} · {signal.sampled_or_indexed_frequency} occurrences</li>)}</ul></>}
+      {individuality.nearest.length > 0 && <><h3>Nearest files</h3>
+        <ul>{individuality.nearest.map(neighbor => <li key={neighbor.id}>{neighbor.name} · {Math.round(neighbor.overlap * 100)}% overlap
+          {neighbor.verified_content_duplicate && ' · Verified duplicate'}</li>)}</ul></>}
+      <button className="secondary" onClick={() => ledger<Vocabulary>('vocabulary_advice', { reference }).then(setVocabulary).catch(fail)}>Review vocabulary</button>
+      {vocabulary && <><p>{vocabulary.recommendation.replaceAll('-', ' ')}</p>{vocabulary.proposals.map(proposal =>
+        <details key={proposal.tag}><summary>{proposal.tag}</summary>
+          {proposal.evidence.map(item => <blockquote key={item.file}>{item.evidence}</blockquote>)}
+          <button className="secondary" onClick={() => {
+            if (window.confirm(`Apply ${proposal.tag} to the reviewed files?`)) {
+              ledger('vocabulary_apply', { reference, tag: proposal.tag, confirmed: true }).then(() => { setVocabulary(null); refresh() }).catch(fail)
+            }
+          }}>Apply verified tag</button>
+        </details>)}</>}
+    </section>}
     {tab === 'History' && <section className="inspect-block">
       {history.map((record, index) => <div className="compact-event" key={index}><strong>{record.action}</strong><span>{displayDate(record.time)}</span></div>)}
       {!!commits.length && <h3><GitBranch size={15} /> Git history</h3>}
@@ -180,6 +207,8 @@ export function Disk({ roots, initial, task, busy, fail }: { roots: string[]; in
   const [path, setPath] = useState(initial)
   const [space, setSpace] = useState<Space>()
   const [groups, setGroups] = useState<DuplicateGroup[] | null>(null)
+  const [report, setReport] = useState<{ database_bytes: number; reusable_bytes: number; wal_bytes: number;
+    groups: Record<string, number> } | null>(null)
   useEffect(() => {
     let active = true
     if (path) ledger<Space>('space', { path }).then((space) => {
@@ -196,6 +225,13 @@ export function Disk({ roots, initial, task, busy, fail }: { roots: string[]; in
       }}><Archive size={16} /> Find duplicates</button></div>
     <div className="toolbar"><label>Indexed folder <select value={path} onChange={(event) => setPath(event.target.value)}>
       {path && !roots.includes(path) && <option>{path}</option>}{!path && <option value="">Choose a folder</option>}{roots.map((root) => <option key={root}>{root}</option>)}</select></label></div>
+    <section className="card"><h2>Ledger storage</h2>
+      <button className="secondary" onClick={() => ledger<NonNullable<typeof report>>('storage_usage').then(setReport).catch(fail)}>Measure Ledger</button>
+      {report && <><p>{bytes(report.database_bytes)} in Ledger pages · {bytes(report.reusable_bytes)} reusable · {bytes(report.wal_bytes)} in journal</p>
+        <dl className="metadata">{Object.entries(report.groups).map(([group, size]) => <div key={group}>
+          <dt>{group.replaceAll('_', ' ')}</dt><dd>{bytes(size)}</dd>
+        </div>)}</dl></>}
+    </section>
     {space ? <>
       <div className="metrics"><div><span>Logical size</span><strong>{bytes(space.logical)}</strong></div>
         <div><span>Known allocation</span><strong>{bytes(space.known_allocated)}</strong>{space.unknown_allocation > 0 && <small>{space.unknown_allocation} unknown</small>}</div>

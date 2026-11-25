@@ -233,6 +233,11 @@ pub(crate) fn assess(
     assessor: &str,
     note: Option<&str>,
 ) -> Result<()> {
+    let assessor = match assessor {
+        "filesystem" => "f",
+        "ai" => "a",
+        other => other,
+    };
     ensure!(
         [scores.importance, scores.information, scores.hotness]
             .iter()
@@ -380,7 +385,9 @@ impl Mosh {
 
     pub(crate) fn file_tier_for(&self, obj: &Object) -> Result<Value> {
         let value=self.db.prepare_cached("SELECT f.importance,f.information,f.predicted_hotness,f.human_accesses,f.last_access,
-            f.target,f.effective,f.requested,f.locked,f.assessor,f.assessment,f.revision,
+            f.target,f.effective,f.requested,f.locked,
+            CASE f.assessor WHEN 'f' THEN 'filesystem' WHEN 'a' THEN 'ai' ELSE f.assessor END,
+            f.assessment,f.revision,
             coalesce(s.confirmed,0),t.minimum_tags FROM object_keys k JOIN file_tiers f ON f.object_key=k.key
             LEFT JOIN tag_sets s ON k.tag_set=s.id JOIN tiers t ON t.level=f.target WHERE k.object=?")?
             .query_row([&obj.id],|r| {

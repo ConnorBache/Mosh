@@ -6,7 +6,7 @@ Mosh is a local-first file explorer and searchable Ledger for Windows. It indexe
 
 Download the Windows x64 installer or CLI ZIP from [GitHub Releases](https://github.com/ConnorBache/Mosh/releases). The desktop application uses Microsoft Edge WebView2. The initial installer is unsigned. Compare its SHA-256 hash with the release checksum before running it.
 
-The published v0.1.0 preview uses Ledger format 1. Building from current source uses Ledger format 4 with compact file identifiers, packed tags, the optional content cache, and intelligence features. Back up your Ledger before opening it with the newer build.
+The 0.2.0 preview uses Ledger format 7 with compact file identifiers, packed tags, nested Mosh boundaries, and intelligence features. Back up your Ledger before opening it with the newer build. See the [preview release notes](docs/release-preview.md).
 
 1. Open **Mosh** and choose **Index folder**. Select an ordinary directory.
 2. Browse the indexed folder. Double-click a folder to enter it or a file to open it with its Windows association. Select a row to inspect metadata, a text preview, tags, Paint, and available history.
@@ -76,7 +76,27 @@ The Ledger stores packed tag sets and reverse lookups. Identical tag sets share 
 
 The optional content cache stores searchable terms and positions up to the requested number of SQLite page bytes. It invalidates entries after Mosh observes file changes. Run the same command to rebuild it or pass zero to clear it. `doctor` reports the database size, reusable pages, tag storage, and cache sizes. The write-ahead log and temporary SQLite work files can use additional disk space during writes.
 
-Format 1 through 3 Ledgers migrate on open. The migration keeps their tags, aliases, confidence, evidence, Paint, relationships, and history. Existing UUIDs resolve as aliases for compact IDs. Format 1's extracted-text cache is rebuilt on demand. Format 3 gives existing files an initial tier and carries dictionary IDs forward into the Tag Registry. Run `mosh ledger compact` to return reusable pages to the filesystem after an upgrade or cache clear. Keep a backup and allow temporary disk space for compaction.
+Older Ledgers migrate on open. The migration keeps their tags, aliases, confidence, evidence, Paint, relationships, permissions, and history. Existing UUIDs resolve as aliases for compact IDs. Format 1's extracted-text cache is rebuilt on demand. Run `mosh ledger compact` to return reusable pages to the filesystem after an upgrade or cache clear. Inspect `mosh doctor` for per-table storage, reusable pages, and journal sizes.
+
+## Individuality and vocabulary
+
+The **Individuality** tab and `mosh individuality <file>` compare distinct confirmed direct tags against a bounded set of permitted neighbors. Lower values indicate closer matches. Exact duplicates found by verified duplicate analysis appear separately. Scores use the current tag index when requested. Review quoted evidence before approving a proposed assignment. Tag merge and deletion require `--confirm`.
+
+Search feedback evaluates a trial against the confirmed miss and up to 12 other labeled searches. The trial commits when the primary rank improves and the evaluated controls reproduce their baselines without losing rank. Its report in **Agents** includes rejected trials, metrics, and the proposed tags.
+
+## Nested Moshes
+
+Index each child in its own Ledger. In the parent, attach that Ledger and its physical root. The parent can suggest permitted routing metadata. Searching a child requires a separate request and a grant issued in the child Ledger.
+
+~~~powershell
+mosh --db parent.sqlite3 scope info
+mosh --db parent.sqlite3 scope attach child.sqlite3 C:\Work\Child 'Child project' --tag engineering
+mosh --db child.sqlite3 scope allow PARENT_MOSH_ID local
+mosh --db parent.sqlite3 scope route 'engineering'
+mosh --db parent.sqlite3 scope handoff CHILD_MOSH_ID 'ext:rs'
+~~~
+
+The **Nested Moshes** page exposes the same actions. Other actors need a parent discovery grant and their own child handoff grant. A handoff result includes the child's qualified file ID. A moved or unavailable attachment retains its boundary until the registration is updated or detached.
 
 ## Safety and recovery
 

@@ -417,6 +417,14 @@ fn read_set(db: &Connection, object_key: i64) -> Result<(Option<i64>, Tags)> {
     ))
 }
 
+pub(crate) fn confirmed(db: &Connection, object: i64) -> Result<std::collections::BTreeSet<i64>> {
+    Ok(read_set(db, object)?
+        .1
+        .into_iter()
+        .filter_map(|(id, origins)| (origins & !SUGGESTED != 0).then_some(id))
+        .collect())
+}
+
 pub fn detail(
     db: &Connection,
     object: &str,

@@ -1229,17 +1229,17 @@ impl Mosh {
             || plan.after.is_some()
             || plan.before.is_some();
         let mut notes = note.into_iter().collect::<Vec<_>>();
-        let (explicit, composite) = crate::query::explicit_tag_terms(input);
+        let (explicit, required, composite) = crate::query::explicit_filters(input)?;
         let protected = explicit
             .iter()
-            .map(|(_, name)| name.clone())
+            .filter(|(field, _)| {
+                matches!(
+                    field.as_str(),
+                    "tag" | "direct-tag" | "inherited-tag" | "suggested-tag"
+                )
+            })
+            .filter_map(|(_, name)| organization::tag_name(name).ok())
             .collect::<BTreeSet<_>>();
-        let required = explicit
-            .iter()
-            .filter(|_| !composite)
-            .map(|(field, name)| Ok(format!("{field}:{}", query_value(name)?)))
-            .collect::<Result<Vec<_>>>()?
-            .join(" AND ");
         let mut relaxed = Vec::new();
         let db_start = Instant::now();
         if relation || plan.topic.is_some() {
@@ -1350,6 +1350,20 @@ impl Mosh {
                     let entry = candidates.entry(item.id).or_default();
                     entry.0 += 10;
                     entry.1.insert("name or Paint terms".into());
+                }
+            }
+            if candidates.is_empty() && !required.is_empty() && plan.branches.is_empty() {
+                for item in self.search(
+                    &required,
+                    &SearchOptions {
+                        limit: cfg.max_candidates,
+                        ..Default::default()
+                    },
+                )? {
+                    candidates.insert(
+                        item.id,
+                        (15, BTreeSet::from(["explicit Ledger filters".into()]), None),
+                    );
                 }
             }
             if cfg.search_mode == "exhaustive"
@@ -1485,7 +1499,8 @@ impl Mosh {
             None
         };
         Ok(
-            json!({"id":log,"plan":plan,"results":rows,"answer":composed,"metrics":metrics,"notes":notes,"relaxed_tags":relaxed}),
+            json!({"id":log,"plan":plan,"results":rows,"answer":composed,"metrics":metrics,"notes":notes,
+                "relaxed_tags":relaxed,"child_suggestions":self.child_pointers(input,None)?}),
         )
     }
 
@@ -1567,42 +1582,159 @@ impl Mosh {
             }
         }
         let baseline = rank(&prior_ids);
-        let enrichment = if baseline != Some(1) {
-            self.process_job(
-                &Job {
-                    id: job.id,
-                    kind: "enrich".into(),
-                    key: Some(key),
-                    revision: object.revision,
-                    scope: 0,
-                    claim: job.claim.clone(),
-                    attempts: job.attempts,
-                },
-                cfg,
-                cancel,
-            )?
-        } else {
-            json!({"diagnostic":"The confirmed result already ranked first."})
+        let source = content::preview(&object);
+        let mut replay_cfg = cfg.clone();
+        replay_cfg.learn = false;
+        replay_cfg.semantic = false;
+        let replay = |request: &str, plan: &Plan| {
+            self.retrieve(
+                request,
+                plan,
+                &replay_cfg,
+                Instant::now(),
+                None,
+                false,
+                Some(job.scope),
+            )
         };
-        let replay = self.retrieve(
-            &request,
-            &plan,
-            cfg,
-            Instant::now(),
-            None,
-            false,
-            Some(job.scope),
+        let get_rank = |run: &Value, id: &str| {
+            run["results"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .position(|value| value["object"]["id"] == id)
+                .map(|rank| rank + 1)
+        };
+        let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+        ensure!(!cancel.load(Ordering::Relaxed), "improvement cancelled");
+        let valid: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM ai_jobs WHERE id=? AND claim=? AND state='running')",
+            params![job.id, job.claim],
+            |r| r.get(0),
         )?;
-        let after = replay["results"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|v| v["object"]["id"].clone())
-            .collect::<Vec<_>>();
-        let new_rank = rank(&after);
+        ensure!(
+            valid && self.find(&object.id)?.revision == object.revision,
+            "source or worker changed"
+        );
+        let mut reference = tx.prepare("SELECT r.id,r.request,r.plan,r.result,o.id FROM retrieval_feedback f
+            JOIN retrievals r ON r.id=f.run JOIN object_keys k ON k.key=f.object_key JOIN objects o ON o.id=k.object
+            WHERE r.actor='local' AND r.id<>?1 AND f.helpful=1 AND o.missing=0
+            ORDER BY (f.object_key=?2) DESC,r.id DESC LIMIT 12")?;
+        let previous = reference
+            .query_map(params![job.scope, key], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(reference);
+        let start = replay(&request, &plan)?;
+        let starting_rank = get_rank(&start, &object.id);
+        let mut cases = Vec::new();
+        for (id, request, serialized, recorded, file) in previous {
+            if self.find(&file).is_err() {
+                continue;
+            }
+            let plan: Plan = serde_json::from_str(&serialized)?;
+            let before = replay(&request, &plan)?;
+            let rank = get_rank(&before, &file);
+            let prior_ids: Vec<String> = serde_json::from_str(&recorded)?;
+            let had_result = prior_ids.iter().any(|old| {
+                old == &file
+                    || crate::lean::resolve(&self.db, old)
+                        .ok()
+                        .flatten()
+                        .as_deref()
+                        == Some(file.as_str())
+            });
+            cases.push((
+                id,
+                request,
+                plan,
+                file,
+                rank,
+                had_result && rank.is_none(),
+                before["metrics"].clone(),
+            ));
+        }
+        let mut writer = packed_tags::Writer::new(&tx);
+        let mut added = BTreeMap::new();
+        let mut passages_added = 0;
+        for draft in passages::dialogue(&source) {
+            if let Some(id) = passages::save(&tx, key, object.revision, &source, &draft, true)? {
+                passages_added += 1;
+                for tag in passages::event_tags(&draft) {
+                    added.entry(tag).or_insert(format!("passage:{id}"));
+                }
+            }
+        }
+        added.extend(crate::individuality::structured_signals(&source));
+        let present = packed_tags::confirmed(&tx, key)?;
+        let mut changes = Vec::new();
+        for (tag, evidence) in added {
+            let id = organization::dictionary_id(&tx, &tag)?;
+            if present.contains(&id) {
+                continue;
+            }
+            let retired: bool = tx.query_row(
+                "SELECT retired IS NOT NULL FROM tag_registry WHERE id=?",
+                [id],
+                |r| r.get(0),
+            )?;
+            if retired {
+                continue;
+            }
+            writer.assign(
+                &object.id,
+                id,
+                packed_tags::CONTEXTUAL,
+                Some((1.0, Some(&evidence))),
+            )?;
+            registry::record(
+                &tx,
+                id,
+                Some(key),
+                Some("contextual"),
+                "verify",
+                "retrieval-evaluation",
+                Some(object.revision),
+                None,
+            )?;
+            changes.push(tag);
+        }
+        writer.flush()?;
+        let after = replay(&request, &plan)?;
+        let new_rank = get_rank(&after, &object.id);
+        let mut reports = Vec::new();
+        let mut regressions = 0;
+        let mut unverified = 0;
+        for (id, request, plan, file, before, unreproducible, metrics) in cases {
+            ensure!(!cancel.load(Ordering::Relaxed), "improvement cancelled");
+            let after = replay(&request, &plan)?;
+            let rank = get_rank(&after, &file);
+            let regressed = rank.unwrap_or(usize::MAX) > before.unwrap_or(usize::MAX);
+            regressions += usize::from(regressed);
+            unverified += usize::from(unreproducible);
+            reports.push(json!({"run":id,"expected":file,"before":before,"after":rank,
+                "regressed":regressed,"baseline_unreproducible":unreproducible,"baseline_metrics":metrics,"replay_metrics":after["metrics"]}));
+        }
+        let improves = new_rank.unwrap_or(usize::MAX) < starting_rank.unwrap_or(usize::MAX)
+            && new_rank.unwrap_or(usize::MAX) < baseline.unwrap_or(usize::MAX);
+        let applied = improves && regressions == 0 && unverified == 0;
+        if applied {
+            tx.commit()?;
+        } else {
+            tx.rollback()?;
+        }
         Ok(
-            json!({"baseline_rank":baseline,"new_rank":new_rank,"improved":new_rank.is_some() && new_rank.unwrap()<baseline.unwrap_or(usize::MAX),
-            "baseline_metrics":serde_json::from_str::<Value>(&metrics)?,"replay_metrics":replay["metrics"],"indexing":enrichment}),
+            json!({"baseline_rank":baseline,"starting_rank":starting_rank,"new_rank":new_rank,"improved":applied,
+            "applied":applied,"regressions":regressions,"unreproducible_controls":unverified,"controls":reports,
+            "baseline_metrics":serde_json::from_str::<Value>(&metrics)?,"replay_metrics":after["metrics"],
+            "indexing":{"tags":changes,"candidate_passages":passages_added,"model_tokens":0,"api_cost_micros":0}}),
         )
     }
 

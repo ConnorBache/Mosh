@@ -623,6 +623,8 @@ impl Mosh {
     ) -> Result<()> {
         let source = Path::new(&entry.source);
         let destination = Path::new(entry.destination.as_deref().context("no destination")?);
+        self.outside_children(source)?;
+        self.outside_children(destination)?;
         if plan.action == Action::Quarantine {
             self.quarantine_parents(destination, roots)?;
         }
@@ -813,6 +815,8 @@ impl Mosh {
                     .as_deref()
                     .context("missing journal destination")?,
             );
+            self.outside_children(destination)?;
+            self.outside_children(Path::new(&entry.source))?;
             let source = Path::new(&entry.source);
             let recovery = if plan.action == Action::Copy {
                 let root = roots

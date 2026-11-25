@@ -147,7 +147,45 @@ impl Mosh {
             )?,
             "undo" => self.undo_plan(required(payload, "id")?, payload["confirmed"] == true)?,
             "doctor" => self.doctor()?,
+            "storage_usage" => self.storage_usage()?,
+            "mosh_info" => json!({"mosh":self.mosh_id()?,"children":self.child_pointers("",None)?}),
+            "mosh_route" => json!(self.child_pointers(query(), payload["child"].as_str())?),
+            "mosh_attach" => self.register_child(
+                path()?,
+                Path::new(required(payload, "root")?),
+                required(payload, "name")?,
+                payload["paint"].as_str().unwrap_or(""),
+                &payload
+                    .get("tags")
+                    .cloned()
+                    .map(serde_json::from_value::<Vec<String>>)
+                    .transpose()?
+                    .unwrap_or_default(),
+            )?,
+            "mosh_detach" => self.detach_child(required(payload, "child")?)?,
+            "mosh_discovery" => self.child_discovery(
+                required(payload, "child")?,
+                required(payload, "actor")?,
+                payload["enabled"] == true,
+            )?,
+            "mosh_allow" => self.grant_handoff(
+                required(payload, "parent")?,
+                required(payload, "actor")?,
+                payload["enabled"] == true,
+            )?,
+            "mosh_handoff" => self.child_handoff(
+                required(payload, "child")?,
+                query(),
+                payload["natural"] == true,
+            )?,
             "tier" => self.file_tier(reference()?)?,
+            "individuality" => self.individuality(reference()?)?,
+            "vocabulary_advice" => self.vocabulary_advice(reference()?)?,
+            "vocabulary_apply" => self.apply_vocabulary_tag(
+                reference()?,
+                required(payload, "tag")?,
+                payload["confirmed"] == true,
+            )?,
             "tier_settings" => self.tier_settings()?,
             "configure_tiers" => self.configure_tiers(
                 &serde_json::from_value::<Vec<crate::tiers::Tier>>(payload["tiers"].clone())?,
@@ -170,6 +208,10 @@ impl Mosh {
             "configure_detected_models" => serde_json::to_value(self.configure_detected_models()?)?,
             "queue_index" => self.queue_index(query(), limit(payload), payload["force"] == true)?,
             "queue_backfill" => {
+                ensure!(
+                    limit(payload) <= 100 || payload["confirmed"] == true,
+                    "confirm the large backfill"
+                );
                 self.queue_backfill(required(payload, "tag")?, query(), limit(payload))?
             }
             "ai_queue" => json!(self.ai_queue(limit(payload))?),
@@ -205,6 +247,11 @@ impl Mosh {
             )?,
             "tag_preview" => self.tag_preview(required(payload, "tag")?, limit(payload))?,
             "tag_dictionary" => {
+                ensure!(
+                    !matches!(payload["action"].as_str(), Some("merge" | "delete"))
+                        || payload["confirmed"] == true,
+                    "confirm the vocabulary change"
+                );
                 self.tag_dictionary(
                     required(payload, "action")?,
                     required(payload, "tag")?,

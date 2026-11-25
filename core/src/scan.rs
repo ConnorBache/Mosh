@@ -15,6 +15,44 @@ use std::{
     time::{Duration, Instant},
 };
 
+fn sync_watches(
+    db: &Connection,
+    root: &Path,
+    watcher: &mut RecommendedWatcher,
+    watched: &mut BTreeSet<PathBuf>,
+) -> Result<()> {
+    let roots = crate::nested::boundaries(db)?;
+    let mut desired = BTreeSet::new();
+    let mut query=db.prepare_cached("SELECT path FROM objects WHERE missing=0 AND kind='coll' AND reparse=0 AND path IS NOT NULL
+        AND mosh_within_path(path,?)")?;
+    for path in query.query_map([path_text(root)?], |r| {
+        r.get::<_, String>(0).map(PathBuf::from)
+    })? {
+        let path = path?;
+        if !roots
+            .iter()
+            .any(|boundary| crate::nested::within(&path, boundary))
+        {
+            desired.insert(path);
+        }
+    }
+    for path in watched.difference(&desired) {
+        let _ = watcher.unwatch(path);
+    }
+    let mut active = watched
+        .intersection(&desired)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for path in desired.difference(watched) {
+        if fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir() && !fsmeta::reparse(&meta)) {
+            watcher.watch(path, RecursiveMode::NonRecursive)?;
+            active.insert(path.clone());
+        }
+    }
+    *watched = active;
+    Ok(())
+}
+
 #[derive(Default, Debug, Serialize)]
 pub struct ScanReport {
     pub scanned: u64,
@@ -95,7 +133,8 @@ fn identity(
 ) -> Result<Option<Previous>> {
     let existing = db
         .prepare_cached(&format!(
-            "SELECT {STAMP} FROM objects WHERE path=? AND missing=0"
+            "SELECT {STAMP} FROM objects WHERE missing=0 AND path IS NOT NULL
+                AND mosh_path_key(path)=mosh_path_key(?1) AND path=?1"
         ))?
         .query_row([path], previous)
         .optional()?;
@@ -110,6 +149,16 @@ fn identity(
             return Ok(Some(existing));
         }
         forgotten(db, path, false)?;
+    }
+    if let Some(native) = native {
+        let suspended=db.prepare_cached(&format!("SELECT {STAMP} FROM objects
+            WHERE path=?1 AND missing=1 AND native_id=?2 AND kind=?3 AND created IS ?4
+            AND id IN(SELECT k.object FROM nested_suspended s JOIN object_keys k ON s.object_key=k.key
+                WHERE s.child IS NULL) LIMIT 2"))?.query_map(params![path,fsmeta::pack_id(native),kind,created],previous)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if suspended.len() == 1 {
+            return Ok(suspended.into_iter().next());
+        }
     }
     let Some((native, created)) = native.zip(created) else {
         return Ok(None);
@@ -182,9 +231,12 @@ fn index_one(
         .parent()
         .and_then(Path::to_str)
         .map(|parent| {
-            db.prepare_cached("SELECT id FROM objects WHERE path=? AND missing=0")?
-                .query_row([parent], |r| r.get::<_, String>(0))
-                .optional()
+            db.prepare_cached(
+                "SELECT id FROM objects WHERE missing=0 AND path IS NOT NULL
+                AND mosh_path_key(path)=mosh_path_key(?1) AND path=?1",
+            )?
+            .query_row([parent], |r| r.get::<_, String>(0))
+            .optional()
         })
         .transpose()?
         .flatten();
@@ -215,7 +267,7 @@ fn index_one(
     db.prepare_cached("INSERT INTO objects(id,kind,path,parent,name,extension,size,created,modified,changed,native_id,reparse,link_target)
         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
         ON CONFLICT(id) DO UPDATE SET path=?3,parent=?4,name=?5,extension=?6,size=?7,created=?8,modified=?9,
-        changed=?10,native_id=coalesce(?11,native_id),reparse=?12,link_target=?13,revision=revision+?14,
+        changed=?10,native_id=coalesce(?11,native_id),reparse=?12,link_target=?13,revision=revision+?14,missing=0,
         hash=CASE WHEN ?14=1 THEN NULL ELSE hash END")?
         .execute(params![id,kind,key,parent,name,extension,size,created,modified,native.changed,
             native.id.as_deref().map(fsmeta::pack_id),is_reparse,link_target,changed])?;
@@ -223,6 +275,11 @@ fn index_one(
         db.prepare_cached("INSERT OR IGNORE INTO scan_present VALUES(?)")?
             .execute([&id])?;
     }
+    db.prepare_cached(
+        "DELETE FROM nested_suspended WHERE child IS NULL AND
+        object_key=(SELECT key FROM object_keys WHERE object=?)",
+    )?
+    .execute([&id])?;
     if new && kind == "coll" {
         db.prepare_cached("INSERT INTO owners VALUES(?,?)")?
             .execute(params![id, actor])?;
@@ -288,6 +345,7 @@ impl Mosh {
             "choose a physical directory to index"
         );
         let root = canonical(root)?;
+        self.outside_children(&root)?;
         let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
         let report = self.walk(&tx, &root, cancel)?;
         tx.execute(
@@ -302,6 +360,8 @@ impl Mosh {
 
     fn walk(&self, db: &Connection, root: &Path, cancel: &AtomicBool) -> Result<ScanReport> {
         let started = Instant::now();
+        let boundaries = crate::nested::boundaries(db)?;
+        let boundary_ids = crate::nested::boundary_ids(db)?;
         db.execute_batch(
             "CREATE TEMP TABLE IF NOT EXISTS scan_present(id TEXT PRIMARY KEY) WITHOUT ROWID;
             DELETE FROM scan_present;",
@@ -327,6 +387,15 @@ impl Mosh {
                 }
             };
             let path = entry.path();
+            if boundaries
+                .iter()
+                .any(|root| crate::nested::within(path, root))
+            {
+                if entry.file_type().is_dir() {
+                    walker.skip_current_dir();
+                }
+                continue;
+            }
             if path.to_str().is_none() {
                 report.warning(format!(
                     "{}: the path cannot be represented as Unicode",
@@ -346,6 +415,13 @@ impl Mosh {
                 continue;
             }
             match fs::symlink_metadata(path) {
+                Ok(meta)
+                    if entry.file_type().is_dir()
+                        && crate::nested::moved_boundary(path, &meta, &boundary_ids) =>
+                {
+                    walker.skip_current_dir();
+                    continue;
+                }
                 Ok(meta) if fsmeta::reparse(&meta) && entry.file_type().is_dir() => {
                     walker.skip_current_dir()
                 }
@@ -372,6 +448,12 @@ impl Mosh {
         }
         db.execute("DELETE FROM scan_present", [])?;
         for repo in repos {
+            if boundaries
+                .iter()
+                .any(|boundary| crate::nested::within(boundary, &repo))
+            {
+                continue;
+            }
             if let Err(error) = crate::git::refresh(db, &repo) {
                 report.warning(format!("Git {}: {error:#}", repo.display()));
             }
@@ -433,6 +515,7 @@ impl Mosh {
         );
         let started = Instant::now();
         let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+        self.outside_children(path)?;
         let report = match fs::symlink_metadata(path) {
             Ok(_) if skip(path, &self.db_path) => ScanReport::default(),
             Ok(meta) if meta.is_dir() && !fsmeta::reparse(&meta) => self.walk(&tx, path, cancel)?,
@@ -441,7 +524,12 @@ impl Mosh {
                 let changed = index_one(&tx, &mut writer, path, false, &self.actor)?;
                 writer.flush()?;
                 if let Some(repo) = crate::git::root(path) {
-                    crate::git::refresh(&tx, &repo)?;
+                    if !crate::nested::boundaries(&tx)?
+                        .iter()
+                        .any(|boundary| crate::nested::within(boundary, &repo))
+                    {
+                        crate::git::refresh(&tx, &repo)?;
+                    }
                 }
                 ScanReport {
                     scanned: 1,
@@ -469,6 +557,7 @@ impl Mosh {
     ) -> Result<()> {
         self.admin()?;
         let root = canonical(root)?;
+        self.outside_children(&root)?;
         let (send, recv) = mpsc::sync_channel::<notify::Result<Event>>(512);
         let overflow = std::sync::Arc::new(AtomicBool::new(false));
         let watcher_overflow = overflow.clone();
@@ -480,9 +569,22 @@ impl Mosh {
             },
             notify::Config::default(),
         )?;
-        watcher.watch(&root, RecursiveMode::Recursive)?;
+        watcher.watch(&root, RecursiveMode::NonRecursive)?;
+        let mut watched = BTreeSet::from([root.clone()]);
         report(self.scan(&root, cancel));
+        sync_watches(&self.db, &root, &mut watcher, &mut watched)?;
+        let mut boundary_version = self
+            .db
+            .pragma_query_value(None, "data_version", |r| r.get::<_, i64>(0))?;
         while !cancel.load(Ordering::Relaxed) {
+            let version = self
+                .db
+                .pragma_query_value(None, "data_version", |r| r.get::<_, i64>(0))?;
+            if version != boundary_version {
+                sync_watches(&self.db, &root, &mut watcher, &mut watched)?;
+                boundary_version = version;
+            }
+            let boundaries = crate::nested::boundaries(&self.db)?;
             let mut paths = BTreeSet::<PathBuf>::new();
             let mut rescan = overflow.swap(false, Ordering::Relaxed);
             let first = recv.recv_timeout(Duration::from_millis(250));
@@ -499,6 +601,12 @@ impl Mosh {
                                 continue;
                             }
                             for path in event.paths {
+                                if boundaries
+                                    .iter()
+                                    .any(|boundary| crate::nested::within(&path, boundary))
+                                {
+                                    continue;
+                                }
                                 if path.components().any(|p| {
                                     p.as_os_str() == ".git" || p.as_os_str() == ".mosh-quarantine"
                                 }) {
@@ -515,6 +623,10 @@ impl Mosh {
             }
             if rescan {
                 report(self.scan(&root, cancel));
+                sync_watches(&self.db, &root, &mut watcher, &mut watched)?;
+                continue;
+            }
+            if paths.is_empty() {
                 continue;
             }
             let (present, missing): (Vec<_>, Vec<_>) = paths
@@ -526,6 +638,7 @@ impl Mosh {
                 }
                 report(self.refresh_path(&path, cancel));
             }
+            sync_watches(&self.db, &root, &mut watcher, &mut watched)?;
         }
         Ok(())
     }

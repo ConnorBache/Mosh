@@ -2,9 +2,11 @@ mod commands;
 mod content;
 mod fsmeta;
 mod git;
+mod individuality;
 mod intelligence;
 mod lean;
 pub mod models;
+mod nested;
 mod operations;
 mod organization;
 mod packed_tags;
@@ -36,7 +38,7 @@ pub struct Mosh {
     actor: String,
 }
 
-const LEDGER_VERSION: i64 = 5;
+const LEDGER_VERSION: i64 = 7;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Object {
@@ -179,6 +181,7 @@ impl Mosh {
         content::register(&db)?;
         lean::register(&db)?;
         fsmeta::register(&db)?;
+        nested::register(&db)?;
         db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA cache_size=-32768; PRAGMA temp_store=FILE;")?;
         let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
         if version != LEDGER_VERSION {
@@ -204,6 +207,13 @@ impl Mosh {
             }
             if matches!(locked_version, 1..=4) {
                 lean::normalize_legacy_paths(&tx)?;
+            }
+            if locked_version < 6 {
+                tx.execute_batch(include_str!("ledger_v6.sql"))?;
+            }
+            if locked_version < 7 {
+                tx.execute_batch(include_str!("nested.sql"))?;
+                tx.execute("INSERT INTO metadata VALUES('mosh_id',?)", [uuid()])?;
             }
             tx.pragma_update(None, "user_version", LEDGER_VERSION)?;
             tx.commit()?;
@@ -261,7 +271,8 @@ impl Mosh {
                 let key = path.as_deref().and_then(Path::to_str).unwrap_or(reference);
                 self.db
                     .query_row(
-                        "SELECT * FROM objects WHERE path=? AND missing=0",
+                        "SELECT * FROM objects WHERE missing=0 AND path IS NOT NULL
+                         AND mosh_path_key(path)=mosh_path_key(?1) AND path=?1",
                         [key],
                         object,
                     )

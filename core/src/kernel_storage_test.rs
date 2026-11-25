@@ -218,3 +218,211 @@ fn supplemental_storage_budget() -> Result<()> {
     let (_, source) = source_size(&fresh)?;
     measure_densities(&fresh, files, source)
 }
+
+#[test]
+#[ignore = "measures compacted pages, journals and churn on generated files"]
+fn storage_churn_workload() -> Result<()> {
+    use std::{sync::Arc, thread, time::Duration};
+    let fixture = tempfile::Builder::new()
+        .prefix("mosh-storage-churn-")
+        .tempdir()?;
+    let scratch = fixture.path().join("scratch");
+    fs::create_dir(&scratch)?;
+    let mut records = Vec::new();
+    for (kind, mode) in [("repeated", 0), ("overlap", 1), ("diverse", 2)] {
+        let root = fixture.path().join(format!("source-{mode}"));
+        for folder in 0..24 {
+            fs::create_dir_all(root.join(format!("component-{folder:02}/subsystem")))?;
+        }
+        let path_for =
+            |n: usize| root.join(format!("component-{:02}/subsystem/unit-{n:04}.rs", n % 24));
+        let count = 1200;
+        for n in 0..count {
+            fs::write(
+                path_for(n),
+                format!(
+                    "// generated unit {n}\n{}",
+                    "const COUNT: usize = 1;\n".repeat(170)
+                ),
+            )?;
+        }
+        let mosh = Mosh::open(&fixture.path().join(format!("mode-{mode}.sqlite3")))?;
+        let quote = scratch.to_str().unwrap().replace('\'', "''");
+        mosh.db
+            .execute_batch(&format!("PRAGMA temp_store_directory='{quote}';"))?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader = stop.clone();
+        let wal = mosh.db_path().with_extension("sqlite3-wal");
+        let journal = mosh.db_path().with_extension("sqlite3-journal");
+        let temp = scratch.clone();
+        let peak = thread::spawn(move || {
+            let mut journals = 0;
+            let mut temporary = 0;
+            while !reader.load(std::sync::atomic::Ordering::Relaxed) {
+                let bytes = |path: &Path| fs::metadata(path).map_or(0, |m| m.len());
+                journals = journals.max(bytes(&wal) + bytes(&journal));
+                temporary = temporary.max(
+                    fs::read_dir(&temp)
+                        .into_iter()
+                        .flatten()
+                        .flatten()
+                        .map(|entry| bytes(&entry.path()))
+                        .sum::<u64>(),
+                );
+                thread::sleep(Duration::from_millis(4));
+            }
+            (journals, temporary)
+        });
+        let measured = (|| -> Result<Value> {
+            let cancel = AtomicBool::new(false);
+            let scan = mosh.scan(&root, &cancel)?;
+            assert_eq!(scan.errors, 0);
+            let first = mosh.find(path_for(100).to_str().unwrap())?;
+            mosh.set_paint(&first.id, "minimal", "Keep this annotation", true)?;
+            mosh.tag(&first.id, "preserved-note", true, 1.0)?;
+            mosh.compact()?;
+            let fresh = mosh.storage_usage()?;
+            let lookup_paths = (0..250)
+                .map(|n| dunce::canonicalize(path_for((n * 7) % count)))
+                .collect::<std::io::Result<Vec<_>>>()?;
+            let index_read = |hash: bool| -> Result<f64> {
+                let sql = if hash {
+                    "SELECT id FROM objects WHERE missing=0 AND path IS NOT NULL AND
+                    mosh_path_key(path)=mosh_path_key(?1) AND path=?1"
+                } else {
+                    "SELECT id FROM objects WHERE missing=0 AND path=?1"
+                };
+                let mut query = mosh.db.prepare(sql)?;
+                let time = Instant::now();
+                for path in &lookup_paths {
+                    assert!(
+                        !query
+                            .query_row([path.to_str().unwrap()], |r| r.get::<_, String>(0))?
+                            .is_empty()
+                    );
+                }
+                Ok(time.elapsed().as_secs_f64() * 4.0)
+            };
+            let compact_lookup = index_read(true)?;
+            let mut legacy = Value::Null;
+            if mode == 0 {
+                mosh.db.execute_batch("DROP TRIGGER unique_live_path_insert; DROP TRIGGER unique_live_path_update;
+                    DROP INDEX live_path_key; CREATE UNIQUE INDEX live_path ON objects(path) WHERE missing=0 AND path IS NOT NULL;
+                    DROP INDEX object_git; CREATE INDEX object_git ON objects(git_root,git_status);
+                    CREATE INDEX file_tier_rank ON file_tiers(effective,object_key);
+                    DROP INDEX object_parent;
+                    CREATE INDEX object_parent ON objects(parent,missing,name COLLATE NOCASE,id);
+                    UPDATE file_tiers SET assessor='filesystem' WHERE assessor='f';")?;
+                mosh.compact()?;
+                legacy = json!({"storage":mosh.storage_usage()?,"exact_path_mean_ms":index_read(false)?});
+                mosh.db.execute_batch(include_str!("ledger_v6.sql"))?;
+            }
+            let vocabulary = (0..2048)
+                .map(|n| crate::organization::dictionary_id(&mosh.db, &format!("load:{n:04}")))
+                .collect::<Result<Vec<_>>>()?;
+            let fill = |density: usize| -> Result<Value> {
+                let time = Instant::now();
+                let tx = Transaction::new_unchecked(&mosh.db, TransactionBehavior::Immediate)?;
+                let mut statement=tx.prepare("SELECT k.key FROM object_keys k JOIN objects o ON o.id=k.object WHERE o.kind='file' AND o.missing=0 ORDER BY k.key")?;
+                let keys = statement
+                    .query_map([], |r| r.get::<_, i64>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                drop(statement);
+                let mut writer = Writer::new(&tx);
+                for (i, key) in keys.into_iter().enumerate() {
+                    let (id, before) = read_set(&tx, key)?;
+                    let mut tags: Tags = before
+                        .iter()
+                        .filter(|(tag, _)| **tag < vocabulary[0])
+                        .map(|(&tag, &bits)| (tag, bits))
+                        .collect();
+                    let shared = match mode {
+                        0 => density,
+                        1 => density * 3 / 4,
+                        _ => 0,
+                    };
+                    let seed = if mode == 1 { (i / 40 % 8) * 151 } else { 0 };
+                    for &tag in &vocabulary[seed..seed + shared] {
+                        if tags.len() == density {
+                            break;
+                        }
+                        tags.insert(tag, USER);
+                    }
+                    let mut rng = i as u64 + 1;
+                    while tags.len() < density {
+                        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                        tags.entry(vocabulary[(rng >> 32) as usize % vocabulary.len()])
+                            .or_insert(USER);
+                    }
+                    writer.replace(key, id, &before, &tags)?;
+                }
+                writer.flush()?;
+                tx.commit()?;
+                let index_ms = time.elapsed().as_millis();
+                mosh.compact()?;
+                let storage = mosh.storage_usage()?;
+                let time = Instant::now();
+                for _ in 0..10 {
+                    mosh.search(
+                        "direct-tag:load:0000 direct-tag:load:0001",
+                        &SearchOptions {
+                            limit: 25,
+                            ..Default::default()
+                        },
+                    )?;
+                }
+                Ok(
+                    json!({"tags":density,"storage":storage,"write_ms":index_ms,"intersection_mean_ms":time.elapsed().as_secs_f64()*100.0}),
+                )
+            };
+            let before = [fill(100)?, fill(1000)?];
+            for n in 0..60 {
+                fs::write(
+                    path_for(n),
+                    "// source updated after initial import".repeat(130),
+                )?;
+                let renamed = path_for(n + 60).with_file_name(format!("renamed-{n:04}.rs"));
+                fs::rename(path_for(n + 60), renamed)?;
+                fs::remove_file(path_for(n + 120))?;
+            }
+            let churn = mosh.scan(&root, &cancel)?;
+            let repeat = mosh.scan(&root, &cancel)?;
+            assert_eq!(churn.errors + repeat.errors, 0);
+            assert_eq!(repeat.changed, 0);
+            assert_eq!(
+                mosh.paint(&first.id)?
+                    .context("renamed file lost its Paint")?["body"],
+                "Keep this annotation"
+            );
+            let after = [fill(100)?, fill(1000)?];
+            Ok(
+                json!({"workload":kind,"scan_ms":scan.elapsed_ms,"churn_scan_ms":churn.elapsed_ms,
+                "recheck_ms":repeat.elapsed_ms,"legacy_layout":legacy,"fresh":fresh,"exact_path_mean_ms":compact_lookup,
+                "before_churn":before,"after_churn":after}),
+            )
+        })();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (journal, temp) = peak.join().expect("storage sampler");
+        let mut record = measured?;
+        record["sampled_peak_journal_bytes"] = json!(journal);
+        record["sampled_peak_temp_bytes"] = json!(temp);
+        records.push(record);
+    }
+    for mut record in records {
+        // The doctor output still exposes per-table totals on demand.
+        let trim = |v: &mut Value| {
+            if let Some(map) = v.as_object_mut() {
+                map.remove("tables");
+            }
+        };
+        trim(&mut record["fresh"]);
+        trim(&mut record["legacy_layout"]["storage"]);
+        for phase in ["before_churn", "after_churn"] {
+            for row in record[phase].as_array_mut().unwrap() {
+                trim(&mut row["storage"]);
+            }
+        }
+        println!("{record}");
+    }
+    Ok(())
+}

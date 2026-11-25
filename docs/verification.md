@@ -69,3 +69,20 @@ The same 10,000 generated C files on Windows NTFS were scanned with the precedin
 Source text caching, embedding, and AI enrichment were disabled. The benchmark used small synthetic contents to exercise normal filesystem scanning and measures bytes per file. Its ratio to source bytes depends on typical file size. The first scan took 5.38 seconds with format 3 and 10.18 seconds with format 4 in this run. Allocated-space queries now read live filesystem details and may take longer across broad selections.
 
 To reproduce, build the release CLI at commit `fcabd41`, set `MOSH_FORMAT_3_CLI` to that executable, and run `cargo test --locked --release supplemental_storage_budget -- --ignored --nocapture`. The test removes its generated files and Ledgers.
+
+## Preview storage and churn
+
+Run `cargo test --locked --release storage_churn_workload -- --ignored --nocapture` to reproduce the generated NTFS workload. Each of the three tag distributions starts with 1,200 files and 4,922,490 source bytes. The churn phase edits, renames and removes 60 files each, then rescans twice. It finishes with 1,140 active files and 4,726,720 source bytes.
+
+- The same fresh records and annotations occupied **1,007 bytes per file** with the prior index layout and **867 bytes per file** with the preview layout. File records and their key mapping account for **270 bytes per file**. The two layouts were compacted and compared on the same fixture. A warm exact-path lookup averaged 0.0047 ms with the previous layout and 0.0058 ms with the preview.
+- With 100 and 1,000 direct tags, compacted bytes per active file before churn were **1,007 and 1,051** for repeated sets, **1,212 and 2,000** for overlapping sets, and **1,324 and 3,417** for diverse sets.
+- After churn the corresponding counts were **1,132 and 1,132**, **1,369 and 2,116**, and **1,538 and 3,553**. The denominator changes when files are removed. Durable user annotations and the identity across a rename were verified.
+- First scans took 1.46–1.51 s. Churn scans took 0.35–0.38 s, unchanged rescans took 0.27–0.28 s, and mean warm intersections ranged from 0.69 to 2.13 ms. The largest sampled journal and scratch footprints were 7,333,632 bytes and 282,900 bytes. The sampler observes visible files at roughly 4 ms intervals. Reusable bytes and logical versus physical bytes appear separately in the report.
+
+These are small generated workloads. The kernel benchmark remains available for source-tree comparison.
+
+## Preview retrieval evaluation
+
+`cargo test --locked --release --test retrieval_quality -- --nocapture` evaluates 38 generated files and tracks tuned and held-out questions separately. The one tuned miss moved to rank one. On six held-out queries, top-1 accuracy, recall@3, and MRR each rose from **0.50 to 1.00**. Mean held-out latency rose from **1.67 to 2.10 ms**. The compacted database occupied **385,024 bytes** before and after within this small fixture's page allocation. The trial spent zero model tokens. A separate test rejects an improvement to the primary query when it demotes a known result in a control query.
+
+The labeled cases include paraphrasing, reversed roles, dated evidence, misleading tags, overlapping records, and exact duplicates. A separate actor exercises the inaccessible source. The benchmark treats a correctly empty answer as a correct abstention. No configured local inference model was available for this preview's real-model trial.

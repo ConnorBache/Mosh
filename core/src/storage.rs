@@ -3,12 +3,55 @@ use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 use serde_json::{Value, json};
 use std::{
+    collections::BTreeMap,
     fs::{self, File},
     io::{BufReader, Read},
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
+
+fn page_group(name: &str) -> &'static str {
+    match name {
+        "objects"
+        | "object_keys"
+        | "sqlite_autoindex_objects_1"
+        | "sqlite_autoindex_object_keys_1" => "file_records",
+        "audit" | "object_audit" => "audit_history",
+        "file_tiers" | "file_tier_rank" | "tiers" => "tier_records",
+        "live_path" | "live_path_key" | "object_path" => "file_indexes",
+        "text_cached" => "source_text_cache",
+        "paint"
+        | "embeddings"
+        | "vectors_model"
+        | "retrievals"
+        | "retrieval_feedback"
+        | "passages"
+        | "passage_relation"
+        | "sqlite_autoindex_passages_1"
+        | "coverage" => "optional_intelligence",
+        _ if name.starts_with("object_") => "file_indexes",
+        _ if name.starts_with("ledger_") => "name_path_search",
+        _ if name.starts_with("tag_") || name.starts_with("sqlite_autoindex_tag_") => {
+            "packed_tags_and_registry"
+        }
+        _ if name.starts_with("text_terms_") => "source_text_cache",
+        _ if name.starts_with("ai_")
+            || name.starts_with("sqlite_autoindex_ai_")
+            || name.starts_with("retrieval_")
+            || name.starts_with("mosh_evaluation_") =>
+        {
+            "optional_intelligence"
+        }
+        _ => "other",
+    }
+}
+
+fn sidecar_bytes(path: &Path, suffix: &str) -> u64 {
+    let mut sidecar = path.as_os_str().to_os_string();
+    sidecar.push(suffix);
+    fs::metadata(sidecar).map_or(0, |metadata| metadata.len())
+}
 
 fn equals(a: &mut File, b: &mut File) -> std::io::Result<bool> {
     use std::io::{Seek, SeekFrom};
@@ -48,10 +91,51 @@ fn checked_snapshot(item: &crate::Object) -> Result<File> {
 }
 
 impl Mosh {
+    pub fn storage_usage(&self) -> Result<Value> {
+        self.admin()?;
+        let read = self.db.unchecked_transaction()?;
+        let pragma = |name| read.pragma_query_value(None, name, |r| r.get::<_, i64>(0));
+        let page_size = pragma("page_size")?;
+        let database = page_size * pragma("page_count")?;
+        let reusable = page_size * pragma("freelist_count")?;
+        let mut groups = BTreeMap::new();
+        let mut tables = BTreeMap::new();
+        let mut occupied = 0;
+        {
+            let mut query = read.prepare("SELECT name,sum(pgsize) FROM dbstat GROUP BY name")?;
+            for result in
+                query.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+            {
+                let (name, bytes) = result?;
+                *groups.entry(page_group(&name)).or_insert(0) += bytes;
+                occupied += bytes;
+                tables.insert(name, bytes);
+            }
+        }
+        let (files, source, scan, durable):(i64,i64,i64,i64) = read.query_row("SELECT
+            (SELECT count(*) FROM objects WHERE missing=0 AND kind='file' AND reparse=0),
+            (SELECT coalesce(sum(size),0) FROM objects WHERE missing=0 AND kind='file' AND reparse=0),
+            (SELECT count(*) FROM audit WHERE action IN ('discovered','external-modified','external-move','external-missing')),
+            (SELECT count(*) FROM audit WHERE action NOT IN ('discovered','external-modified','external-move','external-missing'))",
+            [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
+        read.commit()?;
+        Ok(
+            json!({"database_bytes":database,"occupied_bytes":occupied,"reusable_bytes":reusable,
+            "structural_bytes":database-occupied-reusable,"groups":groups,"tables":tables,
+            "files":files,"source_bytes":source,"routine_scan_events":scan,"durable_events":durable,
+            "physical_bytes":fs::metadata(&self.db_path)?.len(),
+            "wal_bytes":sidecar_bytes(&self.db_path,"-wal"),"shm_bytes":sidecar_bytes(&self.db_path,"-shm"),
+            "rollback_journal_bytes":sidecar_bytes(&self.db_path,"-journal")}),
+        )
+    }
+
     pub fn duplicates(&self, root: Option<&Path>, cancel: &AtomicBool) -> Result<Value> {
         self.admin()?;
         let start = Instant::now();
         let scope = root.map(canonical).transpose()?;
+        if let Some(path) = &scope {
+            self.outside_children(path)?;
+        }
         let range = scope.as_deref().map(path_text).transpose()?.map(prefix);
         let filter = "o.kind='file' AND o.missing=0 AND o.reparse=0 AND o.path IS NOT NULL
             AND (?1 IS NULL OR (o.path>=?1 AND o.path<?2))";
@@ -196,6 +280,7 @@ impl Mosh {
     pub fn space(&self, root: &Path) -> Result<Value> {
         self.admin()?;
         let root = canonical(root)?;
+        self.outside_children(&root)?;
         let root = path_text(&root)?;
         let (low, high) = prefix(root);
         let scope = "kind='file' AND reparse=0 AND missing=0 AND path>=?1 AND path<?2";
@@ -312,11 +397,12 @@ impl Mosh {
             |r| r.get(0),
         )?;
         let text = self.text_status()?;
+        let storage = self.storage_usage()?;
         Ok(
             json!({"ok":integrity==["ok"]&&foreign_violations==0&&active==ledger_count&&forward==reverse,"integrity":integrity,
             "foreign_key_violations":foreign_violations,"objects":active,"ledger_documents":ledger_count,
             "pending_recovery_steps":uncertain,"database_bytes":page_count*page_size,"reusable_bytes":reusable*page_size,
-            "tag_storage_bytes":tag_pages,"confirmed_assignments":forward,"confirmed_postings":reverse,"text_cache":text}),
+            "tag_storage_bytes":tag_pages,"confirmed_assignments":forward,"confirmed_postings":reverse,"text_cache":text,"storage":storage}),
         )
     }
 
@@ -364,6 +450,7 @@ impl Mosh {
         ensure!(source.is_file(), "backup file is missing");
         let source =
             Connection::open_with_flags(source, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        crate::lean::register(&source)?;
         let version: i64 = source.pragma_query_value(None, "user_version", |r| r.get(0))?;
         ensure!(
             (1..=crate::LEDGER_VERSION).contains(&version),
