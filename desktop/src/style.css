@@ -181,3 +181,8 @@ summary { cursor: pointer; }
   .workspace { position: relative; }
   .inspector { position: absolute; inset: 0 0 auto auto; z-index: 1; min-height: 100%; box-shadow: -6px 0 15px #26382a20; }
 }
+.intel form, .intel article { margin: 1rem 0; }
+.intel label:not(.check) { display: grid; gap: .4rem; }
+.intel-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: .8rem; margin: 1rem 0; }
+.intel fieldset { border: 1px solid var(--line); border-radius: 8px; }
+.intel blockquote { margin: 1em 0; padding-left: 1em; border-left: 2px solid; white-space: pre-wrap; }

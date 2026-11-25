@@ -1,12 +1,12 @@
 # Mosh
 
-Mosh is a local-first file explorer and searchable Ledger for Windows. It indexes existing directories in place and lets one file appear in several virtual collections. The initial build works offline and requires no AI model.
+Mosh is a local-first file explorer and searchable Ledger for Windows. It indexes existing directories in place and lets one file appear in several virtual collections. Filesystem operations, direct search, and deterministic indexing work offline.
 
 ## Install and start
 
 Download the Windows x64 installer or CLI ZIP from [GitHub Releases](https://github.com/ConnorBache/Mosh/releases). The desktop application uses Microsoft Edge WebView2. The initial installer is unsigned. Compare its SHA-256 hash with the release checksum before running it.
 
-The v0.1.0 preview uses Ledger format 1. Build from current source to use packed tags and the optional content cache in Ledger format 2.
+The published v0.1.0 preview uses Ledger format 1. Building from current source adds packed tags, the optional content cache, and the Ledger format 3 intelligence features. Back up your Ledger before opening it with the newer build.
 
 1. Open **Mosh** and choose **Index folder**. Select an ordinary directory.
 2. Browse the indexed folder. Double-click a folder to enter it or a file to open it with its Windows association. Select a row to inspect metadata, a text preview, tags, Paint, and available history.
@@ -33,6 +33,22 @@ Extract `mosh.exe` and run it from PowerShell. Commands produce JSON.
 
 For directory watching, keep the watch command running and use Ctrl+C to stop. Manual desktop rescans and the CLI scan reconcile missed changes. Use `mosh --help` and `mosh <command> --help` for command arguments.
 
+## Information tiers and Ask Mosh
+
+Files have separate importance, information, and hotness scores. The default direct-tag minimums are **1 for T1, 5 for T2, 10 for T3, and 100 for T4**. Change these under **Settings → Information tiers**. T5 through T10 are inactive until configured. Inherited and suggested tags do not count. A file keeps its valid tags when its effective tier falls below its target. Inspect a file to see the reason, override the target, or request reassessment.
+
+**Settings → AI providers and agents** configures Ollama, OpenAI, or an OpenAI-compatible endpoint. Ollama defaults to loopback. Choose models by role or use **Use detected models** to fill empty roles from the installed model list. Agent background work is opt-in. To run a local Ollama server with cloud features disabled, set `OLLAMA_NO_CLOUD=1` before starting it. Remote providers read keys from the process environment and require explicit opt-in, pricing, spending limits, and a source Coll permission before reading source content.
+
+Use **Agents** to queue indexing, run jobs, and inspect their status and model usage. Ask Mosh can return scoped citations, and you can point it to a relevant file if a search misses. It replays that search after indexing and reports whether the confirmed file moved up.
+
+~~~powershell
+.mosh.exe intelligence tier_settings
+.mosh.exe intelligence model_status
+.mosh.exe intelligence queue_index --json '{"query":"ext:txt","limit":20}'
+.mosh.exe intelligence ai_run --json '{"limit":20}'
+.mosh.exe ask --answer 'What did John assign Matt last week?'
+~~~
+
 ## Search syntax
 
 Queries support uppercase `AND`, `OR`, and `NOT`, standalone parentheses, and an implicit `AND` between expressions. `NOT` binds first, followed by `AND` and then `OR`. Use double quotes inside the expression for phrases and spaces.
@@ -58,7 +74,7 @@ The Ledger stores packed tag sets and reverse lookups. Identical tag sets share 
 
 The optional content cache stores searchable terms and positions up to the requested number of SQLite page bytes. It invalidates entries after Mosh observes file changes. Run the same command to rebuild it or pass zero to clear it. `doctor` reports the database size, reusable pages, tag storage, and cache sizes. The write-ahead log and temporary SQLite work files can use additional disk space during writes.
 
-Format 1 Ledgers migrate on open. The migration preserves UUIDs, tag origins, aliases, confidence, evidence, Paint, and history. It drops the old extracted-text cache because Mosh can read the source again. Run `mosh ledger compact` to return reusable pages to the filesystem after an upgrade or cache clear. Keep a backup and allow temporary disk space for compaction.
+Format 1 and 2 Ledgers migrate on open. The migration preserves UUIDs, tag origins, aliases, confidence, evidence, Paint, and history. Format 1's extracted-text cache is rebuilt on demand. Format 3 gives existing files an initial tier and carries dictionary IDs forward into the Tag Registry. Run `mosh ledger compact` to return reusable pages to the filesystem after an upgrade or cache clear. Keep a backup and allow temporary disk space for compaction.
 
 ## Safety and recovery
 

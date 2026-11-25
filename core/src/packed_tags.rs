@@ -5,31 +5,23 @@ use std::collections::{BTreeMap, HashMap};
 pub const USER: u8 = 1;
 pub const FILESYSTEM: u8 = 4;
 pub const SUGGESTED: u8 = 16;
-pub const ORIGINS: [(u8, &str); 5] = [
+pub const AI: u8 = 32;
+pub const CONTEXTUAL: u8 = 64;
+pub const ORIGINS: [(u8, &str); 7] = [
     (USER, "user"),
     (2, "automatic"),
     (FILESYSTEM, "filesystem"),
     (8, "git"),
     (SUGGESTED, "suggested"),
+    (AI, "ai"),
+    (CONTEXTUAL, "contextual"),
 ];
 const BLOCK: i64 = 4096;
-const MAX_TAGS: usize = 1000;
 const BUFFERED_BLOCKS: usize = 4096;
-const SET_GAPS: u8 = 32;
-const SET_RUNS: u8 = 33;
+const SET_GAPS: u8 = 128;
+const SET_RUNS: u8 = 129;
 type Tags = BTreeMap<i64, u8>;
 type BlockKey = (i64, bool, i64);
-
-#[derive(Debug)]
-pub struct TagLimit;
-
-impl std::fmt::Display for TagLimit {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("this object already has 1,000 direct tags")
-    }
-}
-
-impl std::error::Error for TagLimit {}
 
 fn push_num(buffer: &mut Vec<u8>, mut n: u64) {
     while n >= 128 {
@@ -65,7 +57,7 @@ fn pack_set(tags: &Tags) -> Vec<u8> {
         .values()
         .next()
         .copied()
-        .filter(|bit| tags.values().all(|value| value == bit))
+        .filter(|bit| !matches!(bit, 32 | 33) && tags.values().all(|value| value == bit))
         .unwrap_or(0);
     let mut packed = vec![common];
     let mut previous = 0;
@@ -80,7 +72,7 @@ fn pack_set(tags: &Tags) -> Vec<u8> {
         return packed;
     }
     // Store uncommon origins by ordinal instead of spending an origin byte on every tag.
-    let mut frequency = [0usize; 32];
+    let mut frequency = [0usize; 128];
     for &bits in tags.values() {
         frequency[bits as usize] += 1;
     }
@@ -136,21 +128,17 @@ fn pack_set(tags: &Tags) -> Vec<u8> {
 
 fn unpack_set(packed: &[u8]) -> Result<Tags> {
     let (&common, mut tail) = packed.split_first().context("missing tag-set header")?;
-    if matches!(common, SET_GAPS | SET_RUNS) {
+    if matches!(common, 32 | 33 | SET_GAPS | SET_RUNS) {
         let (&default, remaining) = tail.split_first().context("missing default tag origin")?;
-        ensure!((1..32).contains(&default), "invalid default tag origin");
+        ensure!((1..128).contains(&default), "invalid default tag origin");
         tail = remaining;
         let count = pop_num(&mut tail)?;
-        // v1 deterministic filesystem tags could slightly exceed the user tagging limit.
-        ensure!(
-            count > 0 && count <= MAX_TAGS as u64 + 8,
-            "packed tag count out of range"
-        );
-        let mut entries = Vec::with_capacity(count as usize);
+        ensure!(count > 0, "packed tag count must be positive");
+        let mut entries = Vec::new();
         let mut last = 0;
         while entries.len() < count as usize {
             let first = add_gap(last, &mut tail)?;
-            let length = if common == SET_RUNS {
+            let length = if matches!(common, 33 | SET_RUNS) {
                 pop_num(&mut tail)?
             } else {
                 1
@@ -161,6 +149,7 @@ fn unpack_set(packed: &[u8]) -> Result<Tags> {
             );
             last = first.checked_add(length - 1).context("tag run overflow")?;
             ensure!(last <= i64::MAX as u64, "tag ID out of range");
+            entries.try_reserve(usize::try_from(length)?)?;
             entries.extend((first..=last).map(|tag| (tag as i64, default)));
         }
         let mut after = 0;
@@ -168,7 +157,7 @@ fn unpack_set(packed: &[u8]) -> Result<Tags> {
             let index = add_gap(after, &mut tail)?;
             ensure!(index < count, "tag origin override exceeds set");
             let (&bits, rest) = tail.split_first().context("missing tag origin override")?;
-            ensure!((1..32).contains(&bits), "invalid tag origin override");
+            ensure!((1..128).contains(&bits), "invalid tag origin override");
             entries[index as usize].1 = bits;
             tail = rest;
             after = index + 1;
@@ -191,7 +180,7 @@ fn unpack_set(packed: &[u8]) -> Result<Tags> {
         } else {
             common
         };
-        ensure!((1..32).contains(&origins), "invalid tag origins");
+        ensure!((1..128).contains(&origins), "invalid tag origins");
         tags.insert(tag as i64, origins);
     }
     Ok(tags)
@@ -612,9 +601,6 @@ impl<'a> Writer<'a> {
                 (0.0..=1.0).contains(&confidence),
                 "confidence must be between zero and one"
             );
-            if !tags.contains_key(&tag) && tags.len() >= MAX_TAGS {
-                return Err(TagLimit.into());
-            }
             *tags.entry(tag).or_default() |= origin;
             store_detail(self.db, object, tag, origin, confidence, evidence)?;
         } else if let Some(bits) = tags.get_mut(&tag) {
@@ -627,6 +613,9 @@ impl<'a> Writer<'a> {
                     "DELETE FROM tag_details WHERE object_key=? AND tag=? AND origin=?",
                 )?
                 .execute(params![object, tag, origin])?;
+        }
+        if value.is_none() {
+            require_file_tag(self.db, object, &tags)?;
         }
         self.replace(object, id, &old, &tags)?;
         Ok(object)
@@ -641,14 +630,50 @@ impl<'a> Writer<'a> {
             *bits != 0
         });
         for &tag in ids {
-            if tags.len() < MAX_TAGS || tags.contains_key(&tag) {
-                *tags.entry(tag).or_default() |= FILESYSTEM;
-            }
+            *tags.entry(tag).or_default() |= FILESYSTEM;
         }
         self.db
             .prepare_cached("DELETE FROM tag_details WHERE object_key=? AND origin=?")?
             .execute(params![object, FILESYSTEM])?;
         self.replace(object, id, &old, &tags)
+    }
+
+    pub fn invalidate_enrichment(&mut self, object: &str, previous_revision: i64) -> Result<()> {
+        let key = key(self.db, object)?;
+        let (id, old) = read_set(self.db, key)?;
+        let mut tags = old.clone();
+        tags.retain(|_, mask| {
+            *mask &= !(AI | CONTEXTUAL);
+            *mask != 0
+        });
+        if tags == old {
+            return Ok(());
+        }
+        if tags.values().all(|mask| mask & !SUGGESTED == 0) {
+            let fallback = crate::organization::dictionary_id(self.db, "file")?;
+            *tags.entry(fallback).or_default() |= FILESYSTEM;
+        }
+        for (&tag, &mask) in &old {
+            for (origin, label) in [(AI, "ai"), (CONTEXTUAL, "contextual")] {
+                if mask & origin == 0 {
+                    continue;
+                }
+                crate::registry::record(
+                    self.db,
+                    tag,
+                    Some(key),
+                    Some(label),
+                    "stale",
+                    "scanner",
+                    Some(previous_revision),
+                    None,
+                )?;
+            }
+        }
+        self.db
+            .prepare_cached("DELETE FROM tag_details WHERE object_key=? AND origin IN (?,?)")?
+            .execute(params![key, AI, CONTEXTUAL])?;
+        self.replace(key, id, &old, &tags)
     }
 
     pub fn retag(&mut self, from: i64, to: Option<i64>) -> Result<()> {
@@ -709,6 +734,7 @@ impl<'a> Writer<'a> {
                 self.db
                     .prepare_cached("DELETE FROM tag_details WHERE object_key=? AND tag=?")?
                     .execute(params![object, from])?;
+                require_file_tag(self.db, object, &tags)?;
                 self.replace(object, id, &old, &tags)?;
             }
             self.flush()?;
@@ -716,6 +742,18 @@ impl<'a> Writer<'a> {
         }
         Ok(())
     }
+}
+
+fn require_file_tag(db: &Connection, key: i64, tags: &Tags) -> Result<()> {
+    if tags.values().all(|bits| bits & !SUGGESTED == 0) {
+        let is_file=db.prepare_cached("SELECT o.kind='file' FROM object_keys k JOIN objects o ON o.id=k.object WHERE k.key=?")?
+            .query_row([key],|r|r.get::<_,bool>(0))?;
+        ensure!(
+            !is_file,
+            "a file must retain at least one confirmed direct tag"
+        );
+    }
+    Ok(())
 }
 
 pub fn migrate(db: &Connection) -> Result<()> {

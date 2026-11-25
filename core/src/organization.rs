@@ -13,6 +13,7 @@ pub(crate) const VISIBLE: &str = "(?1='local' OR NOT EXISTS(
         substr(o.path,1,length(rtrim(s.path,?2))+1)=rtrim(s.path,?2)||?2))
     AND NOT EXISTS(SELECT 1 FROM owners w JOIN authority a ON a.person=w.person WHERE w.object=s.id)
     AND NOT EXISTS(SELECT 1 FROM guests g WHERE g.object=s.id AND g.person=?1)
+    AND NOT EXISTS(SELECT 1 FROM guest_rights g WHERE g.object=s.id AND g.person=?1 AND g.right='discover')
 ))";
 
 pub(crate) fn tag_name(name: &str) -> Result<String> {
@@ -42,7 +43,7 @@ pub(crate) fn dictionary_id(db: &Connection, name: &str) -> Result<i64> {
     Ok(match tag_id(db, &name)? {
         Some(id) => id,
         None => {
-            db.execute("INSERT INTO tag_dictionary(name) VALUES(?)", [name])?;
+            db.execute("INSERT INTO tag_dictionary(id,name) SELECT coalesce(max(id),0)+1,? FROM tag_registry", [name])?;
             db.last_insert_rowid()
         }
     })
@@ -74,12 +75,13 @@ impl Mosh {
     }
 
     pub(crate) fn editable(&self, item: &Object) -> Result<()> {
+        ensure!(self.permits(item, "edit")?, "edit permission required");
         let guest: bool = self.db.query_row(
             "SELECT EXISTS(SELECT 1 FROM guests WHERE object=? AND person=? AND permission='edit')",
             params![item.id, self.actor],
             |r| r.get(0),
         )?;
-        if self.owns(&item.id)? || guest {
+        if self.owns(&item.id)? || guest || self.explicit_right(item, "edit")? {
             return Ok(());
         }
         if let Some(parent) = &item.parent {
@@ -88,6 +90,8 @@ impl Mosh {
             if self.owns(parent)? || guest {
                 return Ok(());
             }
+            if self.db.query_row("SELECT EXISTS(SELECT 1 FROM guest_rights WHERE object=? AND person=? AND right='edit')",
+                params![parent,self.actor],|r|r.get::<_,bool>(0))? {return Ok(());}
         }
         anyhow::bail!("edit permission required")
     }
@@ -109,7 +113,7 @@ impl Mosh {
     pub fn access(&self, reference: &str, person: &str, permission: &str) -> Result<()> {
         let item = self.get(reference)?;
         ensure!(
-            item.kind != "file" && self.owns(&item.id)?,
+            item.kind != "file" && self.can_manage(&item)?,
             "Coll owner authority required"
         );
         let transaction = self.db.unchecked_transaction()?;
@@ -165,16 +169,20 @@ impl Mosh {
 
     pub fn tags(&self, reference: &str) -> Result<Vec<Value>> {
         let selected = self.get(reference)?;
+        if !self.permits(&selected, "paint")? {
+            return Ok(vec![]);
+        }
+        let readable = crate::security::allowed("paint");
         let sql = format!("{AUTHORITY}, ancestors(id,depth) AS (
             SELECT ?3,0 UNION ALL SELECT o.parent,depth+1 FROM ancestors a JOIN objects o ON o.id=a.id WHERE o.parent IS NOT NULL
-        ), origins(bit,name) AS (VALUES(1,'user'),(2,'automatic'),(4,'filesystem'),(8,'git'),(16,'suggested'))
+        ), origins(bit,name) AS (VALUES(1,'user'),(2,'automatic'),(4,'filesystem'),(8,'git'),(16,'suggested'),(32,'ai'),(64,'contextual'))
         SELECT t.name,g.name,coalesce(d.confidence,1),CASE WHEN d.origin IS NOT NULL THEN d.evidence
             WHEN g.bit=4 THEN 'file metadata' ELSE NULL END,o.id,ancestors.depth
         FROM ancestors JOIN objects o ON o.id=ancestors.id JOIN object_keys k ON k.object=o.id
         JOIN tag_sets s ON s.id=k.tag_set JOIN json_each(mosh_set_tags(s.packed)) a
         JOIN origins g ON (a.value->>1) & g.bit <> 0 JOIN tag_dictionary t ON t.id=(a.value->>0)
         LEFT JOIN tag_details d ON d.object_key=k.key AND d.tag=t.id AND d.origin=g.bit
-        WHERE (ancestors.depth=0 OR g.bit<>16) AND {VISIBLE}
+        WHERE (ancestors.depth=0 OR g.bit<>16) AND {VISIBLE} AND {readable}
         ORDER BY ancestors.depth,t.name,g.name");
         let mut query = self.db.prepare(&sql)?;
         let rows = query.query_map(
@@ -212,6 +220,18 @@ impl Mosh {
                 add.then_some((confidence, None)),
             )?;
             writer.flush()?;
+            if add || old.is_some() {
+                crate::registry::record(
+                    &tx,
+                    id,
+                    Some(crate::tiers::key(&tx, &selected.id)?),
+                    Some("user"),
+                    if add { "assign" } else { "remove" },
+                    &self.actor,
+                    Some(selected.revision),
+                    Some(&json!({"confidence":confidence,"previous":old})),
+                )?;
+            }
             old.map(|(confidence, evidence)| json!({"confidence":confidence,"evidence":evidence}))
         } else {
             None
@@ -230,11 +250,12 @@ impl Mosh {
     }
 
     pub fn tag_catalog(&self, limit: usize) -> Result<Vec<Value>> {
+        let readable = crate::security::allowed("paint");
         let sql = format!(
             "{AUTHORITY}, visible_blocks AS MATERIALIZED (
                 SELECT k.key/4096 block,mosh_make_block(json_group_array(k.key%4096)) packed
                 FROM object_keys k JOIN objects o ON o.id=k.object
-                WHERE o.missing=0 AND {VISIBLE} GROUP BY k.key/4096
+                WHERE o.missing=0 AND {VISIBLE} AND {readable} GROUP BY k.key/4096
             ) SELECT t.name,sum(mosh_block_count(b.packed,v.packed)) n FROM tag_blocks b
             JOIN visible_blocks v ON v.block=b.block JOIN tag_dictionary t ON t.id=b.tag
             WHERE b.suggested=0 GROUP BY t.id HAVING n>0 ORDER BY n DESC,t.name LIMIT ?3"
@@ -252,9 +273,13 @@ impl Mosh {
     }
 
     pub fn tag_coverage(&self) -> Result<Value> {
-        let sql = format!("{AUTHORITY} SELECT count(*),coalesce(sum(n>=10),0),coalesce(sum(n),0)
-            FROM (SELECT coalesce(s.confirmed,0) n FROM objects o JOIN object_keys k ON k.object=o.id
-            LEFT JOIN tag_sets s ON s.id=k.tag_set WHERE o.missing=0 AND {VISIBLE})");
+        let readable = crate::security::allowed("paint");
+        let sql = format!(
+            "{AUTHORITY} SELECT count(*),coalesce(sum(f.effective=f.target),0),
+            coalesce(sum(s.confirmed),0) FROM objects o JOIN object_keys k ON k.object=o.id
+            JOIN file_tiers f ON f.object_key=k.key LEFT JOIN tag_sets s ON s.id=k.tag_set
+            WHERE o.missing=0 AND {VISIBLE} AND {readable}"
+        );
         Ok(self.db.query_row(&sql,params![self.actor,std::path::MAIN_SEPARATOR_STR],|r| {
             let total = r.get::<_,i64>(0)?;
             let covered = r.get::<_,i64>(1)?;
@@ -277,7 +302,7 @@ impl Mosh {
                 tx.execute("DELETE FROM tag_dictionary WHERE id=?", [id])?;
             }
             "alias" | "rename" => {
-                let to = to.context("new name required")?;
+                let to = to.as_deref().context("new name required")?;
                 ensure!(
                     tag_id(&tx, &to)?.is_none(),
                     "the new name is already in use"
@@ -297,7 +322,7 @@ impl Mosh {
                 }
             }
             "merge" => {
-                let target = tag_id(&tx, &to.context("destination tag required")?)?
+                let target = tag_id(&tx, to.as_deref().context("destination tag required")?)?
                     .context("unknown destination tag")?;
                 ensure!(id != target, "choose two distinct tags");
                 packed_tags::Writer::new(&tx).retag(id, Some(target))?;
@@ -322,6 +347,27 @@ impl Mosh {
             None,
             "ok",
         )?;
+        let destination = to
+            .as_deref()
+            .map(|name| tag_id(&tx, name))
+            .transpose()?
+            .flatten();
+        if action == "merge" {
+            tx.execute(
+                "UPDATE tag_registry SET replacement=?,retired=? WHERE id=?",
+                params![destination, crate::now(), id],
+            )?;
+        }
+        crate::registry::record(
+            &tx,
+            id,
+            None,
+            None,
+            action,
+            &self.actor,
+            None,
+            Some(&json!({"from":from,"to":destination})),
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -338,6 +384,9 @@ impl Mosh {
 
     pub fn paint(&self, reference: &str) -> Result<Option<Value>> {
         let selected = self.get(reference)?;
+        if !self.permits(&selected, "paint")? {
+            return Ok(None);
+        }
         Ok(self.db.query_row("SELECT level,body,revision,locked,origin FROM paint WHERE object=?",[selected.id],|r| {
             let revision = r.get::<_,i64>(2)?;
             Ok(json!({"level":r.get::<_,String>(0)?,"body":r.get::<_,String>(1)?,"revision":revision,

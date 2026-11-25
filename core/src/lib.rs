@@ -2,12 +2,18 @@ mod commands;
 mod content;
 mod fsmeta;
 mod git;
+mod intelligence;
+pub mod models;
 mod operations;
 mod organization;
 mod packed_tags;
+mod passages;
 mod query;
+mod registry;
 mod scan;
+mod security;
 mod storage;
+pub mod tiers;
 
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, Row, params};
@@ -29,7 +35,7 @@ pub struct Mosh {
     actor: String,
 }
 
-const LEDGER_VERSION: i64 = 2;
+const LEDGER_VERSION: i64 = 3;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Object {
@@ -180,9 +186,12 @@ impl Mosh {
             if locked_version == 0 {
                 tx.execute_batch(include_str!("schema.sql"))?;
             }
-            if locked_version < LEDGER_VERSION {
+            if locked_version < 2 {
                 packed_tags::migrate(&tx)?;
                 tx.execute_batch(include_str!("ledger_v2.sql"))?;
+            }
+            if locked_version < 3 {
+                tiers::migrate(&tx)?;
                 tx.pragma_update(None, "user_version", LEDGER_VERSION)?;
             }
             tx.commit()?;
@@ -255,7 +264,8 @@ impl Mosh {
 
     pub fn inspect(&self, reference: &str) -> Result<Value> {
         let selected = self.get(reference)?;
-        let native = if selected.reparse {
+        let readable = self.permits(&selected, "paint")?;
+        let native = if selected.reparse || !readable {
             Value::Null
         } else {
             selected
@@ -267,12 +277,17 @@ impl Mosh {
         let mut owners = self
             .db
             .prepare("SELECT person FROM owners WHERE object=? ORDER BY person")?;
-        let owners = owners
-            .query_map([&selected.id], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let owners = if readable {
+            owners
+                .query_map([&selected.id], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            vec![]
+        };
         Ok(
             json!({"object":selected,"windows_security":native,"owners":owners,
-            "tags":self.tags(&selected.id)?,"paint":self.paint(&selected.id)?}),
+            "tags":self.tags(&selected.id)?,"paint":self.paint(&selected.id)?,
+            "tier":if readable { self.file_tier_for(&selected)? } else { Value::Null }}),
         )
     }
 

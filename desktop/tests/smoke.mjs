@@ -112,7 +112,20 @@ try {
   await nav('History').click()
   await page.getByRole('textbox', { name: 'Filter activity' }).fill('cleave undone')
   await page.getByText('cleave undone', { exact: true }).waitFor()
-  console.log('Installed desktop smoke test passed: Explorer, inspector, Paint search, Tags, Collections, Disk usage, Cleave, undo, and History.')
+
+  await nav('Settings').click()
+  const tierTwo = page.getByRole('group', { name: 'T2', exact: true })
+  assert.equal(await tierTwo.getByLabel('Minimum tags').inputValue(), '5')
+  await tierTwo.getByLabel('Minimum tags').fill('6')
+  await page.getByRole('button', { name: 'Save tiers' }).click()
+  await page.getByRole('status').filter({ hasText: 'Tiers saved' }).waitFor()
+  await nav('Agents').click()
+  await page.getByRole('heading', { name: 'Agents', exact: true }).waitFor()
+  await nav('Ask Mosh').click()
+  await page.getByRole('textbox', { name: 'What are you looking for?' }).fill('Find Orbit')
+  await page.locator('.intel').getByRole('button', { name: 'Search', exact: true }).click()
+  await page.getByRole('button', { name: 'Orbit.md', exact: true }).waitFor()
+  console.log('Windows desktop smoke test passed for Explorer, Paint, Tags, Collections, disk usage, Cleave undo, History, tier settings, Agents, and Ask Mosh.')
 } finally {
   await browser?.close().catch(() => {})
   if (app.exitCode === null) {

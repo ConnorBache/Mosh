@@ -50,6 +50,8 @@ export interface Details {
   paint: Paint | null
   owners: string[]
   windows_security: { sddl?: string } | null
+  tier: { effective: number | null; target: number; direct_tags: number; minimum_tags: number; locked: boolean;
+    requested: number | null; downgrade: string | null; importance: number; information: number; hotness: number } | null
 }
 
 export interface TagCount { name: string; count: number }

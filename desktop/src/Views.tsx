@@ -52,6 +52,20 @@ export function Inspector({ item, generation, refresh, fail, close, show }: {
       <dl className="metadata"><dt>Kind</dt><dd>{object.kind === 'file' ? object.mime ?? 'File' : object.kind === 'coll' ? 'Coll' : 'Marriage'}</dd>
         <dt>Modified</dt><dd>{displayDate(object.modified)}</dd><dt>Logical size</dt><dd>{bytes(object.size)}</dd><dt>Allocated</dt><dd>{bytes(object.allocated)}</dd>
         {object.git_root && <><dt>Git repository</dt><dd>{leaf(object.git_root)}</dd><dt>Git status</dt><dd>{object.git_status ?? 'Unavailable'}</dd></>}</dl>
+      {detail?.tier && <section className="inspect-block"><h3>Information tier</h3>
+        <p>{detail.tier.effective ? 'T' + detail.tier.effective : 'Unmet minimum'} · Target T{detail.tier.target} · {detail.tier.direct_tags} confirmed direct tags</p>
+        <p className="muted">Importance {detail.tier.importance} · Information {detail.tier.information} · Hotness {detail.tier.hotness}</p>
+        {detail.tier.downgrade && <p>{detail.tier.downgrade}</p>}
+        <form className="inline" key={generation} onSubmit={event => {
+          event.preventDefault()
+          const form = new FormData(event.currentTarget)
+          const request = form.get('tier')
+          ledger('tier_override', { reference, requested: request === '' ? null : Number(request), locked: form.has('lock') }).then(refresh).catch(fail)
+        }}><input type="number" min="1" max="10" name="tier" aria-label="Tier override" placeholder="Auto" defaultValue={detail.tier.requested ?? ''} />
+          <label className="check"><input name="lock" type="checkbox" defaultChecked={detail.tier.locked} /> Lock</label>
+          <button className="secondary">Save tier</button></form>
+        <button className="secondary" onClick={() => ledger('tier_reassess', { reference }).then(refresh).catch(fail)}>Reassess</button>
+      </section>}
       <section className="inspect-block"><h3>Tags</h3>
         {(detail?.tags.length ?? 0) > 18 && <input aria-label="Filter tags" placeholder="Filter tags" value={filter} onChange={(event) => setFilter(event.target.value)} />}
         <div className="chips">{tags.slice(0, 32).map((tag, index) => <span key={tag.name + index} className={'chip' + (tag.inherited ? ' inherited' : '')}
@@ -109,7 +123,7 @@ export function TagExplorer({ generation, search, fail }: { generation: number; 
     })
   }
   return <section className="area">
-    <div className="heading"><div><h1>Tag Explorer</h1>{coverage && <p>{coverage.covered.toLocaleString()} of {coverage.objects.toLocaleString()} objects have 10 or more direct tags</p>}</div>
+    <div className="heading"><div><h1>Tag Explorer</h1>{coverage && <p>{coverage.covered.toLocaleString()} of {coverage.objects.toLocaleString()} files meet their target tier’s tag minimum</p>}</div>
       <button className="primary" disabled={!query} onClick={() => search(query)}><Search size={16} /> Search selection</button></div>
     <div className="toolbar"><input aria-label="Filter tag catalog" placeholder="Filter tags" value={filter} onChange={(event) => setFilter(event.target.value)} />
       <span className="query-caption">{query}</span></div>

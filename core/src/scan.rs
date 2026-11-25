@@ -246,6 +246,15 @@ fn index_one(
             .collect::<Result<Vec<_>>>()?;
         tag_writer.filesystem(&id, &ids)?;
     }
+    if kind == "file" && (changed || renamed) {
+        if changed && !new {
+            let revision: i64 = db
+                .prepare_cached("SELECT revision FROM objects WHERE id=?")?
+                .query_row([&id], |row| row.get(0))?;
+            tag_writer.invalidate_enrichment(&id, revision - 1)?;
+        }
+        crate::tiers::indexed(db, &id)?;
+    }
     if new || changed || renamed {
         let before = previous.map(|old|json!({"path":old.path,"size":old.size,"modified":old.modified,"native_id":old.native}));
         event(
@@ -295,14 +304,14 @@ impl Mosh {
         );
         let root = canonical(root)?;
         let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
-        let mut report = self.walk(&tx, &root, cancel)?;
+        let report = self.walk(&tx, &root, cancel)?;
         tx.execute(
             "INSERT INTO roots VALUES(?,?) ON CONFLICT DO UPDATE SET scanned=excluded.scanned",
             params![path_text(&root)?, now()],
         )?;
         crate::content::trim_after_invalidation(&tx)?;
         tx.commit()?;
-        self.apply_rules(&mut report)?;
+        self.apply_rules()?;
         Ok(report)
     }
 
@@ -383,7 +392,7 @@ impl Mosh {
         Ok(report)
     }
 
-    fn apply_rules(&self, report: &mut ScanReport) -> Result<()> {
+    fn apply_rules(&self) -> Result<()> {
         let mut statement = self
             .db
             .prepare("SELECT tag,query FROM rules ORDER BY tag,query")?;
@@ -416,11 +425,7 @@ impl Mosh {
                     if let Err(error) =
                         writer.assign(&item.id, tag, origin, Some((1.0, Some(&query))))
                     {
-                        if error.is::<crate::packed_tags::TagLimit>() {
-                            report.warning(error);
-                        } else {
-                            return Err(error);
-                        }
+                        return Err(error);
                     }
                 }
                 writer.flush()?;

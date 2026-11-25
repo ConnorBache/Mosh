@@ -215,6 +215,7 @@ pub(crate) fn refresh(db: &Connection, repo: &Path) -> Result<()> {
 impl Mosh {
     pub fn git_history(&self, reference: &str) -> Result<Vec<Value>> {
         let selected = self.get(reference)?;
+        self.require_contents(&selected)?;
         let root = Path::new(
             selected
                 .git_root
@@ -251,6 +252,7 @@ impl Mosh {
 
     pub fn git_diff(&self, reference: &str, revision: Option<&str>) -> Result<String> {
         let selected = self.get(reference)?;
+        self.require_contents(&selected)?;
         let root = Path::new(
             selected
                 .git_root

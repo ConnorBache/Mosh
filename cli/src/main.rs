@@ -28,6 +28,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Retrieve files and source excerpts using an ordinary-language request.
+    Ask {
+        request: String,
+        #[arg(long)]
+        answer: bool,
+    },
+    /// Run intelligence, tier, registry, or permission commands with JSON input.
+    Intelligence {
+        command: String,
+        #[arg(long, default_value = "{}")]
+        json: String,
+    },
     Init,
     Scan {
         path: PathBuf,
@@ -487,6 +499,11 @@ fn run(cli: Cli) -> Result<Option<Value>> {
                 mosh.index_text(max_bytes, &cancel)?
             }
             Command::Doctor => mosh.doctor()?,
+            Command::Ask { request, answer } => mosh.ask(&request, answer)?,
+            Command::Intelligence { command, json } => {
+                let cancel = on_interrupt()?;
+                mosh.command(&command, &serde_json::from_str(&json)?, &cancel)?
+            }
             Command::Backup { destination } => {
                 mosh.backup(&destination)?;
                 json!({"backed_up":destination})

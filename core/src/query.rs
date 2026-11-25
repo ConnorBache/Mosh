@@ -172,6 +172,7 @@ impl Parser {
             "tag" | "direct-tag" | "inherited-tag" | "suggested-tag" => {
                 let id = self.bind(tag_name(value)?);
                 let suggested = u8::from(field == "suggested-tag");
+                let readable = crate::security::allowed("paint");
                 let direct = format!("SELECT k.object FROM tag_blocks b JOIN json_each(mosh_block_slots(b.packed)) p
                     JOIN object_keys k ON k.key=b.block*4096+p.value WHERE b.suggested={suggested}
                     AND b.tag IN(SELECT id FROM tag_dictionary WHERE name={id} UNION SELECT tag FROM tag_aliases WHERE alias={id})");
@@ -181,11 +182,11 @@ impl Parser {
                     } else {
                         "SELECT o2.id FROM objects o2 JOIN matched m2 ON o2.parent=m2.id WHERE o2.missing=0"
                     };
-                    format!("o.id IN(WITH RECURSIVE matched(id) AS ({direct}
+                    format!("({readable} AND o.id IN(WITH RECURSIVE matched(id) AS ({direct}
                         UNION SELECT child.id FROM objects child JOIN matched m ON child.parent=m.id WHERE child.missing=0)
-                        {selection})")
+                        {selection}))")
                 } else {
-                    format!("o.id IN({direct})")
+                    format!("({readable} AND o.id IN({direct}))")
                 }
             }
             "name" => format!("o.name={} COLLATE NOCASE", self.bind(value.to_owned())),
@@ -302,16 +303,23 @@ impl Parser {
                     "o.id IN(SELECT target FROM edges WHERE kind='{kind}' AND container IN({collection}))"
                 )
             }
+            "indexed-content" => {
+                let term = self.bind(format!("\"{}\"", value.replace('"', "\"\"")));
+                let readable = crate::security::allowed("content");
+                format!("({readable} AND o.id IN(SELECT k.object FROM text_terms JOIN object_keys k ON k.key=text_terms.rowid
+                    WHERE text_terms MATCH {term}))")
+            }
             "content" | "paint" | "text" | "" => {
                 let phrase = format!("\"{}\"", value.replace('"', "\"\""));
                 let mut clauses = Vec::new();
                 if field != "content" {
-                    let fts = self.bind(if field == "paint" {
-                        format!("paint:{phrase}")
-                    } else {
-                        phrase.clone()
-                    });
-                    clauses.push(format!("o.id IN(SELECT k.object FROM ledger JOIN object_keys k ON k.key=ledger.rowid WHERE ledger MATCH {fts})"));
+                    if field != "paint" {
+                        let fts = self.bind(format!("{{name path}}:{phrase}"));
+                        clauses.push(format!("o.id IN(SELECT k.object FROM ledger JOIN object_keys k ON k.key=ledger.rowid WHERE ledger MATCH {fts})"));
+                    }
+                    let fts = self.bind(format!("paint:{phrase}"));
+                    let readable = crate::security::allowed("paint");
+                    clauses.push(format!("({readable} AND o.id IN(SELECT k.object FROM ledger JOIN object_keys k ON k.key=ledger.rowid WHERE ledger MATCH {fts}))"));
                 }
                 if field.is_empty() {
                     clauses.push(format!(
@@ -321,10 +329,11 @@ impl Parser {
                 }
                 if field != "paint" {
                     let term = self.bind(phrase);
-                    clauses.push(format!("o.id IN(SELECT k.object FROM text_terms JOIN object_keys k ON k.key=text_terms.rowid
-                        WHERE text_terms MATCH {term})"));
+                    let readable = crate::security::allowed("content");
+                    clauses.push(format!("({readable} AND o.id IN(SELECT k.object FROM text_terms JOIN object_keys k ON k.key=text_terms.rowid
+                        WHERE text_terms MATCH {term}))"));
                     clauses.push(format!("CASE WHEN o.missing=0 AND o.kind='file' AND o.reparse=0 AND o.path IS NOT NULL
-                        AND mosh_text_supported(o.extension) AND {VISIBLE} AND NOT EXISTS(
+                        AND mosh_text_supported(o.extension) AND {VISIBLE} AND {readable} AND NOT EXISTS(
                             SELECT 1 FROM object_keys k JOIN text_cached c ON c.key=k.key WHERE k.object=o.id
                         ) THEN mosh_live_match(o.path,o.extension,o.native_id,o.created,{term}) ELSE 0 END"));
                 }
@@ -337,6 +346,7 @@ impl Parser {
 }
 
 fn direct_intersection(tags: &[String]) -> String {
+    let readable = crate::security::allowed("paint");
     let resolved = |id: &str| {
         format!(
             "SELECT id FROM tag_dictionary WHERE name={id} UNION SELECT tag FROM tag_aliases WHERE alias={id}"
@@ -353,9 +363,9 @@ fn direct_intersection(tags: &[String]) -> String {
         packed.push(format!("b{index}.packed"));
     }
     format!(
-        "o.id IN(SELECT k.object FROM tag_blocks b0 {joins}
+        "({readable} AND o.id IN(SELECT k.object FROM tag_blocks b0 {joins}
         JOIN json_each(mosh_common_slots({})) p JOIN object_keys k ON k.key=b0.block*4096+p.value
-        WHERE b0.suggested=0 AND b0.tag IN({}))",
+        WHERE b0.suggested=0 AND b0.tag IN({})))",
         packed.join(","),
         resolved(&tags[0])
     )

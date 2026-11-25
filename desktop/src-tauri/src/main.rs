@@ -32,7 +32,10 @@ async fn ledger(
         }
         return Ok(Value::Null);
     }
-    let background = matches!(name.as_str(), "scan" | "duplicates" | "execute" | "undo");
+    let background = matches!(
+        name.as_str(),
+        "scan" | "duplicates" | "execute" | "undo" | "ai_run"
+    );
     let cancel = Arc::new(AtomicBool::new(false));
     if background {
         let mut lock = app
@@ -63,11 +66,38 @@ fn main() {
     let db = std::env::var_os("MOSH_DB")
         .map(PathBuf::from)
         .unwrap_or_else(default_db);
+    let state = Arc::new(Desktop {
+        db,
+        running: Mutex::new(None),
+    });
+    let worker = Arc::clone(&state);
     tauri::Builder::default()
-        .manage(Arc::new(Desktop {
-            db,
-            running: Mutex::new(None),
-        }))
+        .manage(state)
+        .setup(move |_| {
+            std::thread::Builder::new()
+                .name("mosh-agents".into())
+                .spawn(move || {
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(3));
+                        if worker
+                            .running
+                            .lock()
+                            .map_or(true, |running| running.is_some())
+                            || !worker.db.is_file()
+                        {
+                            continue;
+                        }
+                        if let Ok(mosh) = Mosh::open(&worker.db)
+                            && mosh
+                                .ai_settings()
+                                .is_ok_and(|settings| settings.background_ready())
+                        {
+                            let _ = mosh.run_agents(1, &AtomicBool::new(false));
+                        }
+                    }
+                })?;
+            Ok(())
+        })
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![ledger])
         .run(tauri::generate_context!())

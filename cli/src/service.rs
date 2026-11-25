@@ -49,6 +49,10 @@ async fn request(
             | "tag_coverage"
             | "graph"
             | "saved"
+            | "tier"
+            | "passages"
+            | "ask"
+            | "feedback"
     ) {
         return (
             StatusCode::NOT_FOUND,

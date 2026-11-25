@@ -35,3 +35,23 @@ The Windows x64 release build scanned an extracted upstream Linux kernel snapsho
 The test includes the object registry, metadata search, both tag directions, and the scan audit log. Synthetic bulk writes use the production packing code and omit individual tag-add audit events. The figures measure the database file after compaction. Transaction logs and compaction can temporarily require more free space. Tag-vocabulary diversity, confidence and evidence, history, and optional source indexing can change the footprint.
 
 To reproduce the storage check against an extracted kernel snapshot, set `MOSH_KERNEL_ROOT` to its root directory and run `cargo test --locked --release -p mosh-core --lib kernel_storage_budget -- --ignored --nocapture`.
+
+## Intelligent Ledger measurements
+
+The Windows x64 release benchmark created **1,000,000 simulated file metadata records** in one disposable SQLite database. The same database was measured before and after migration. It included a common packed direct tag and a rare tag on one file. It used no physical source files or vectors.
+
+- Building and checkpointing the format 2 fixture took 51.88 seconds. Migrating and checkpointing format 3 took 8.80 seconds.
+- The primary database grew from 438,087,680 to 493,289,472 bytes. The increase was 55,201,792 bytes, about **55 bytes per file**, or 12.6% of that metadata-only database. The figures exclude transient SQLite journals.
+- The mean of 30 exact-name FTS engine lookups was 0.0300 ms before and 0.0298 ms after migration. A single public-API search intersecting a common tag with a rare tag and an extension returned the only match in 274.98 ms.
+- The earlier kernel percentages above used packed tags before format 3. Natural-language history, evidence, and semantic indexes were disabled there.
+
+On 125 generated files, including 120 distractors and separate assignment, related-topic, reversed-role, and deadline conversations, scoped search returned all five target sources first. There were five relevant results across five returned results and a mean reported latency of 1.00 ms in the final test run. A broad keyword search returned 123 candidates in the same fixture. One confirmed miss advanced from unranked to first after enrichment and replay. These are fixture results and do not estimate precision on arbitrary documents.
+
+Real local inference ran through Ollama using SmolLM2 135M Instruct Q4_0 and All-MiniLM 22M in a temporary model store. The models occupied about 138 MB combined. The final embedding search found the relevant document first for a paraphrase across three files in 1.24 seconds, including a failed chat-planning attempt and fallback. Across three effective T1 files, indexing used 568 reported tokens per file on average across the two model roles. The warm indexing run took 5.91 seconds and used $0 in API charges. It produced zero accepted AI assessments and zero verified AI tags. An earlier run with model startup took 58.36 seconds. No token averages are available for T2 through T10. A controlled-endpoint test separately checks accepted and rejected tag evidence, tier downgrade, scoped events, and Paint.
+
+~~~powershell
+cargo test --locked --release -- --nocapture
+cargo test --locked --release million_record_metadata -- --ignored --nocapture
+$env:MOSH_OLLAMA_TEST_URL = 'http://127.0.0.1:11434'
+cargo test --locked --release real_ollama_integration -- --ignored --nocapture
+~~~
