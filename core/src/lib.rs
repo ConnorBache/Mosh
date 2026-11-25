@@ -36,7 +36,7 @@ pub struct Mosh {
     actor: String,
 }
 
-const LEDGER_VERSION: i64 = 4;
+const LEDGER_VERSION: i64 = 5;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Object {
@@ -201,8 +201,11 @@ impl Mosh {
             }
             if locked_version < 4 {
                 lean::migrate(&tx)?;
-                tx.pragma_update(None, "user_version", LEDGER_VERSION)?;
             }
+            if matches!(locked_version, 1..=4) {
+                lean::normalize_legacy_paths(&tx)?;
+            }
+            tx.pragma_update(None, "user_version", LEDGER_VERSION)?;
             tx.commit()?;
         }
         ensure!(

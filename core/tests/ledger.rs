@@ -107,6 +107,8 @@ fn v1_migration_preserves_provenance_aliases_and_search_across_vacuum() -> Resul
     let database = temporary.path().join("old.sqlite3");
     let file = temporary.path().join("original.txt");
     fs::write(&file, "a résumé on waterways")?;
+    fs::create_dir(temporary.path().join("alias"))?;
+    let stored = temporary.path().join("alias/../original.txt");
     {
         let db = rusqlite::Connection::open(&database)?;
         db.execute_batch(include_str!("../src/schema.sql"))?;
@@ -114,7 +116,7 @@ fn v1_migration_preserves_provenance_aliases_and_search_across_vacuum() -> Resul
         db.execute(
             "INSERT INTO objects(id,kind,path,name,extension,content) VALUES
             ('old-id','file',?,'original.txt','txt','a stale copy of the original')",
-            [file.to_str().unwrap()],
+            [stored.to_str().unwrap()],
         )?;
         db.execute_batch("INSERT INTO tag_dictionary VALUES(1,'topic'),(2,'candidate'),(3,'subject');
             INSERT INTO tag_aliases VALUES('topic-alias',1);
@@ -124,7 +126,6 @@ fn v1_migration_preserves_provenance_aliases_and_search_across_vacuum() -> Resul
             INSERT INTO paint VALUES('old-id','standard','A useful note',1,1,'user');")?;
     }
     let mosh = Mosh::open(&database)?;
-    assert_eq!(mosh.get("old-id")?.path.as_deref(), file.to_str());
     let check = |query| {
         mosh.search(query, &SearchOptions::default())
             .map(|found| found.len())
@@ -135,6 +136,10 @@ fn v1_migration_preserves_provenance_aliases_and_search_across_vacuum() -> Resul
     assert_eq!(check("paint:useful")?, 1);
     assert_eq!(check("content:resume")?, 1);
     assert_eq!(check("content:stale")?, 0);
+    assert_eq!(
+        mosh.get("old-id")?.path.as_deref(),
+        dunce::canonicalize(&file)?.to_str()
+    );
     mosh.tag("old-id", "topic", false, 1.0)?;
     assert_eq!(check("direct-tag:topic-alias")?, 1);
     mosh.tag_dictionary("merge", "topic", Some("subject"))?;
@@ -161,6 +166,22 @@ fn v1_migration_preserves_provenance_aliases_and_search_across_vacuum() -> Resul
         1
     );
     assert_eq!(mosh.doctor()?["ok"], true);
+    assert_eq!(check("content:resume")?, 1);
+    assert_eq!(check("content:stale")?, 0);
+    let snapshot = temporary.path().join("v1-upgraded-backup.sqlite3");
+    let restored = temporary.path().join("v1-restored.sqlite3");
+    mosh.backup(&snapshot)?;
+    let copy = Mosh::open(&Mosh::restore(&snapshot, &restored)?)?;
+    assert_eq!(copy.get("old-id")?.id, mosh.get("old-id")?.id);
+    assert_eq!(
+        copy.search("content:resume", &SearchOptions::default())?
+            .len(),
+        1
+    );
+    assert!(
+        copy.search("content:stale", &SearchOptions::default())?
+            .is_empty()
+    );
     assert_eq!(
         rusqlite::Connection::open(&database)?.query_row(
             "SELECT count(*) FROM pragma_table_info('objects') WHERE name='content'",
