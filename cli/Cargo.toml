@@ -1,0 +1,15 @@
+[package]
+name = "mosh"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+mosh-core.workspace = true
+clap = { version = "4", features = ["derive", "env"] }
+axum = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync"] }
+subtle = "2"
+ctrlc = "3"

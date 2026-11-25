@@ -1,0 +1,23 @@
+[package]
+name = "mosh-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rusqlite = { version = "0.37", features = ["bundled", "backup", "functions"] }
+uuid = { version = "1", features = ["v4"] }
+blake3 = "1"
+walkdir = "2"
+notify = "8"
+mime_guess = "2"
+dunce = "1"
+tempfile = "3"
+zip = { version = "4", default-features = false, features = ["deflate"] }
+quick-xml = "0.38"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Security", "Win32_Security_Authorization", "Win32_System_IO", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }

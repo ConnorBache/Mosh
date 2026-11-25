@@ -1,0 +1,344 @@
+use crate::{Mosh, canonical, fsmeta, object, path_text, prefix};
+use anyhow::{Context, Result, ensure};
+use rusqlite::{Connection, Transaction, TransactionBehavior, params};
+use serde_json::{Value, json};
+use std::{
+    fs::{self, File},
+    io::{BufReader, Read},
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
+    time::{Duration, Instant},
+};
+
+fn equals(a: &mut File, b: &mut File) -> std::io::Result<bool> {
+    use std::io::{Seek, SeekFrom};
+    a.seek(SeekFrom::Start(0))?;
+    b.seek(SeekFrom::Start(0))?;
+    let mut a = BufReader::with_capacity(64 * 1024, a);
+    let mut b = BufReader::with_capacity(64 * 1024, b);
+    let mut buf1 = [0; 64 * 1024];
+    let mut buf2 = [0; 64 * 1024];
+    loop {
+        let n = a.read(&mut buf1)?;
+        if n == 0 {
+            return Ok(b.read(&mut buf2[..1])? == 0);
+        }
+        b.read_exact(&mut buf2[..n])?;
+        if buf1[..n] != buf2[..n] {
+            return Ok(false);
+        }
+    }
+}
+
+fn checked_snapshot(item: &crate::Object) -> Result<File> {
+    let path = Path::new(item.path.as_deref().context("expected a file path")?);
+    let (size, modified, created, id) = fsmeta::hard_stamp(path)?;
+    ensure!(
+        size == item.size as u64
+            && modified == item.modified
+            && created == item.created
+            && item
+                .native_id
+                .as_ref()
+                .is_none_or(|expected| id.as_ref() == Some(expected)),
+        "file changed since indexing: {}",
+        path.display()
+    );
+    Ok(fsmeta::open_snapshot(path)?)
+}
+
+impl Mosh {
+    pub fn duplicates(&self, root: Option<&Path>, cancel: &AtomicBool) -> Result<Value> {
+        self.admin()?;
+        let start = Instant::now();
+        let scope = root.map(canonical).transpose()?;
+        let range = scope.as_deref().map(path_text).transpose()?.map(prefix);
+        let filter = "o.kind='file' AND o.missing=0 AND o.reparse=0 AND o.path IS NOT NULL
+            AND (?1 IS NULL OR (o.path>=?1 AND o.path<?2))";
+        let query = format!(
+            "SELECT size FROM objects o WHERE {filter} GROUP BY size HAVING count(*)>1 ORDER BY size"
+        );
+        let mut sizes = self.db.prepare(&query)?;
+        let args = params![range.as_ref().map(|r| &r.0), range.as_ref().map(|r| &r.1)];
+        let results = sizes.query_map(args, |r| r.get::<_, i64>(0))?;
+        let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+        tx.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS samples(id TEXT PRIMARY KEY,partial TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS sample_partial ON samples(partial); DELETE FROM samples;",
+        )?;
+        let mut inspected = 0;
+        let mut full_bytes = 0u64;
+        let mut errors = 0;
+        for size in results {
+            ensure!(!cancel.load(Ordering::Relaxed), "duplicate scan cancelled");
+            let size = size?;
+            let mut files = tx.prepare_cached(&format!(
+                "SELECT o.* FROM objects o WHERE {filter} AND o.size=?3"
+            ))?;
+            let files = files.query_map(
+                params![
+                    range.as_ref().map(|r| &r.0),
+                    range.as_ref().map(|r| &r.1),
+                    size
+                ],
+                object,
+            )?;
+            for file in files {
+                ensure!(!cancel.load(Ordering::Relaxed), "duplicate scan cancelled");
+                let item = file?;
+                if let Ok(mut file) = checked_snapshot(&item) {
+                    if let Ok(partial) = fsmeta::partial(&mut file, size as u64) {
+                        tx.prepare_cached("INSERT INTO samples VALUES(?,?)")?
+                            .execute(params![item.id, partial])?;
+                        inspected += 1;
+                        continue;
+                    }
+                }
+                errors += 1;
+            }
+            let mut candidates=tx.prepare_cached("SELECT o.* FROM samples s JOIN objects o ON o.id=s.id
+                WHERE (SELECT count(*) FROM (SELECT 1 FROM samples s2 WHERE s2.partial=s.partial LIMIT 2))=2")?;
+            for item in candidates.query_map([], object)? {
+                ensure!(!cancel.load(Ordering::Relaxed), "duplicate scan cancelled");
+                let item = item?;
+                let digest = (|| -> Result<String> {
+                    let mut file = checked_snapshot(&item)?;
+                    let hash = fsmeta::hash(&mut file)?;
+                    checked_snapshot(&item)?;
+                    Ok(hash)
+                })();
+                if let Ok(digest) = digest {
+                    full_bytes = full_bytes.saturating_add(size as u64);
+                    tx.execute(
+                        "UPDATE objects SET hash=? WHERE id=?",
+                        params![digest, item.id],
+                    )?;
+                } else {
+                    errors += 1;
+                }
+            }
+            tx.execute("DELETE FROM samples", [])?;
+        }
+        drop(sizes);
+        tx.commit()?;
+        let mut groups=self.db.prepare(&format!("SELECT min(o.size),o.hash,count(*) FROM objects o WHERE {filter}
+            AND o.hash IS NOT NULL GROUP BY o.hash HAVING count(*)>1 ORDER BY min(o.size)*(count(*)-1) DESC LIMIT 500"))?;
+        let groups = groups.query_map(
+            params![range.as_ref().map(|r| &r.0), range.as_ref().map(|r| &r.1)],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            },
+        )?;
+        let mut report = Vec::new();
+        for group in groups {
+            let (size, hash, total) = group?;
+            let mut members = self.db.prepare(&format!(
+                "SELECT o.* FROM objects o WHERE {filter} AND hash=?3 ORDER BY path LIMIT 1000"
+            ))?;
+            let mut members = members.query_map(
+                params![
+                    range.as_ref().map(|r| &r.0),
+                    range.as_ref().map(|r| &r.1),
+                    hash
+                ],
+                object,
+            )?;
+            let mut output = Vec::new();
+            let mut physical = std::collections::HashSet::new();
+            let mut representative = None;
+            for item in members.by_ref() {
+                let item = item?;
+                let Ok(mut reader) = checked_snapshot(&item) else {
+                    errors += 1;
+                    continue;
+                };
+                if let Some(first) = &mut representative {
+                    match equals(first, &mut reader) {
+                        Ok(true) => {}
+                        _ => {
+                            errors += 1;
+                            continue;
+                        }
+                    }
+                } else {
+                    representative = Some(reader);
+                }
+                physical.insert(item.native_id.clone().unwrap_or_else(|| item.id.clone()));
+                output.push(item);
+            }
+            if output.len() > 1 {
+                let reclaimable = if total == output.len() as i64
+                    && output
+                        .iter()
+                        .all(|m| m.hardlinks == Some(1) && m.allocated.is_some())
+                {
+                    let sum = output.iter().filter_map(|m| m.allocated).sum::<i64>();
+                    Some(sum - output.iter().filter_map(|m| m.allocated).max().unwrap_or(0))
+                } else {
+                    None
+                };
+                report.push(
+                    json!({"hash":hash,"size":size,"members":output,"total_candidates":total,
+                    "physical_files":physical.len(),"reclaimable_allocated":reclaimable}),
+                );
+            }
+        }
+        Ok(
+            json!({"groups":report,"sampled":inspected,"hashed_bytes":full_bytes,"errors":errors,"elapsed_ms":start.elapsed().as_millis() as u64}),
+        )
+    }
+
+    pub fn space(&self, root: &Path) -> Result<Value> {
+        self.admin()?;
+        let root = canonical(root)?;
+        let root = path_text(&root)?;
+        let (low, high) = prefix(root);
+        let scope = "kind='file' AND reparse=0 AND missing=0 AND path>=?1 AND path<?2";
+        let totals=self.db.query_row(&format!("SELECT count(*), coalesce(sum(size),0), count(*)-count(allocated) FROM objects WHERE {scope}"),
+            params![low,high],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?)))?;
+        let allocated=self.db.query_row(&format!("SELECT coalesce(sum(bytes),0) FROM (
+            SELECT max(allocated) bytes FROM objects WHERE {scope} GROUP BY coalesce(native_id,id))"),
+            params![low,high],|r|r.get::<_,i64>(0))?;
+        let mut distribution = self.db.prepare(&format!(
+            "SELECT
+            CASE WHEN size<1024 THEN 'Under 1 KiB' WHEN size<1048576 THEN '1 KiB–1 MiB'
+                 WHEN size<1073741824 THEN '1 MiB–1 GiB' ELSE '1 GiB or larger' END,
+            count(*),sum(size),min(size) FROM objects WHERE {scope} GROUP BY 1 ORDER BY 4"
+        ))?;
+        let distribution = distribution
+            .query_map(params![low, high], |r| {
+                Ok(json!({
+            "label":r.get::<_,String>(0)?,"files":r.get::<_,i64>(1)?,"logical":r.get::<_,i64>(2)?}))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut kinds = self.db.prepare(&format!(
+            "SELECT extension,count(*),sum(size) FROM objects WHERE {scope}
+            GROUP BY extension ORDER BY sum(size) DESC LIMIT 20"
+        ))?;
+        let kinds = kinds
+            .query_map(params![low, high], |r| {
+                Ok(json!({"extension":r.get::<_,Option<String>>(0)?,
+            "files":r.get::<_,i64>(1)?,"logical":r.get::<_,i64>(2)?}))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut largest = self.db.prepare(&format!(
+            "SELECT * FROM objects WHERE {scope} ORDER BY size DESC LIMIT 20"
+        ))?;
+        let largest = largest
+            .query_map(params![low, high], object)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut tree=self.db.prepare(&format!("SELECT CASE WHEN instr(substr(path,length(?1)+1),?3)=0 THEN substr(path,length(?1)+1)
+            ELSE substr(path,length(?1)+1,instr(substr(path,length(?1)+1),?3)-1) END name,
+            count(*),sum(size) FROM objects WHERE {scope} GROUP BY name ORDER BY sum(size) DESC LIMIT 100"))?;
+        let tree=tree.query_map(params![low,high,std::path::MAIN_SEPARATOR_STR],|r|Ok(json!({
+            "name":r.get::<_,String>(0)?,"files":r.get::<_,i64>(1)?,"logical":r.get::<_,i64>(2)?
+        })))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(
+            json!({"root":root,"files":totals.0,"logical":totals.1,"known_allocated":allocated,
+            "unknown_allocation":totals.2,"largest":largest,"types":kinds,"distribution":distribution,"tree":tree}),
+        )
+    }
+
+    pub fn doctor(&self) -> Result<Value> {
+        self.admin()?;
+        let mut statement = self.db.prepare("PRAGMA integrity_check")?;
+        let integrity = statement
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let foreign_violations =
+            self.db
+                .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+                    r.get::<_, i64>(0)
+                })?;
+        self.db
+            .execute("INSERT INTO ledger(ledger) VALUES('integrity-check')", [])?;
+        let uncertain = self.db.query_row(
+            "SELECT count(*) FROM plan_steps WHERE state IN ('intent','undo-intent')",
+            [],
+            |r| r.get::<_, i64>(0),
+        )?;
+        let active =
+            self.db
+                .query_row("SELECT count(*) FROM objects WHERE missing=0", [], |r| {
+                    r.get::<_, i64>(0)
+                })?;
+        let page_count = self
+            .db
+            .pragma_query_value(None, "page_count", |r| r.get::<_, i64>(0))?;
+        let page_size = self
+            .db
+            .pragma_query_value(None, "page_size", |r| r.get::<_, i64>(0))?;
+        let ledger_count = self
+            .db
+            .query_row("SELECT count(*) FROM ledger", [], |r| r.get::<_, i64>(0))?;
+        Ok(
+            json!({"ok":integrity==["ok"]&&foreign_violations==0&&active==ledger_count,"integrity":integrity,
+            "foreign_key_violations":foreign_violations,"objects":active,"ledger_documents":ledger_count,
+            "pending_recovery_steps":uncertain,"database_bytes":page_count*page_size}),
+        )
+    }
+
+    pub fn rebuild(&self) -> Result<()> {
+        self.admin()?;
+        let tx = self.db.unchecked_transaction()?;
+        tx.execute_batch(
+            "DELETE FROM ledger;
+            INSERT INTO ledger(rowid,object,name,path,content,paint)
+            SELECT o.rowid,o.id,o.name,coalesce(o.path,''),o.content,coalesce(p.body,'')
+            FROM objects o LEFT JOIN paint p ON p.object=o.id WHERE o.missing=0;",
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn backup(&self, destination: &Path) -> Result<()> {
+        self.admin()?;
+        let parent = destination
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let temp = tempfile::NamedTempFile::new_in(parent)?;
+        {
+            let mut backup = Connection::open(temp.path())?;
+            rusqlite::backup::Backup::new(&self.db, &mut backup)?.run_to_completion(
+                512,
+                Duration::from_millis(15),
+                None,
+            )?;
+        }
+        temp.persist_noclobber(destination)?;
+        Ok(())
+    }
+
+    pub fn restore(source: &Path, destination: &Path) -> Result<PathBuf> {
+        ensure!(source.is_file(), "backup file is missing");
+        let source =
+            Connection::open_with_flags(source, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let version: i64 = source.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        ensure!(version == 1, "unsupported Ledger backup format");
+        let status: String = source.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+        ensure!(status == "ok", "backup integrity check failed");
+        if let Some(parent) = destination.parent().filter(|p| !p.as_os_str().is_empty()) {
+            fs::create_dir_all(parent)?;
+        }
+        let parent = destination
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let copy = tempfile::NamedTempFile::new_in(parent)?;
+        {
+            let mut restored = Connection::open(copy.path())?;
+            rusqlite::backup::Backup::new(&source, &mut restored)?.run_to_completion(
+                512,
+                Duration::from_millis(15),
+                None,
+            )?;
+        }
+        copy.persist_noclobber(destination)?;
+        canonical(destination)
+    }
+}

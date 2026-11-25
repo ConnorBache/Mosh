@@ -1,0 +1,59 @@
+name: Windows build
+
+on:
+  push:
+    paths: ['Cargo.*', 'core/**', 'cli/**', 'desktop/**', '.github/workflows/windows.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Test the Rust workspace
+        run: |
+          rustup update stable
+          cargo +stable test --locked
+      - name: Install frontend dependencies
+        working-directory: desktop
+        run: npm ci
+      - name: Build the installer
+        working-directory: desktop
+        run: npm run tauri build -- --bundles nsis --ci
+      - name: Build the CLI
+        run: cargo +stable build --locked --release -p mosh
+      - name: Install on a clean runner and exercise the real desktop
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem target/release/bundle/nsis/*-setup.exe | Select-Object -First 1
+          if (-not $installer) { throw 'NSIS installer missing' }
+          $installDir = Join-Path $env:RUNNER_TEMP 'MoshSmoke'
+          $process = Start-Process -FilePath $installer.FullName -ArgumentList '/S',"/D=$installDir" -Wait -PassThru -WindowStyle Hidden
+          if ($process.ExitCode -ne 0) { throw "Installer exited $($process.ExitCode)" }
+          node desktop/tests/smoke.mjs "$installDir/mosh-desktop.exe" target/release/mosh.exe
+      - name: Prepare release files
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path release
+          Copy-Item target/release/bundle/nsis/*-setup.exe release/
+          Compress-Archive -LiteralPath target/release/mosh.exe,README.md -DestinationPath release/Mosh-cli-windows-x64.zip
+          Get-ChildItem release -File | ForEach-Object {
+            $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $($_.Name)"
+          } | Set-Content release/SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mosh-windows-x64
+          path: release/
+          if-no-files-found: error
