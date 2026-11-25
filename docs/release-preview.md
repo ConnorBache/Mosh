@@ -15,3 +15,8 @@ Check Windows package hashes against the published `SHA256SUMS.txt`. The preview
 - Use integer identity for Ledger references and retain prior object IDs as aliases where needed.
 - Share native volume identity across files. Read current size and timestamps from the filesystem and keep a compact change stamp for scan reconciliation.
 - Search names, relative paths, and Paint directly and read source text on demand. Migration removes persistent text search indexes, including the optional extracted-text index.
+
+## Ledger format 13 in source builds
+
+- Share the physical parent through the directory record and use one file index for exact-path lookup and directory membership.
+- Count assignments once per tag set and use packed tag postings for search. The separate tag-set owner index is removed.

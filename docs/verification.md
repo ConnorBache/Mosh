@@ -122,6 +122,16 @@ Run `python scripts/measure_lean_ledger.py <format-11-cli> <format-12-cli>` to c
 - The scan took **5.92 to 4.00 s**. Median CLI wall-clock times across three calls were **27.62 to 27.53 ms** by ID, **30.43 to 29.38 ms** for an exact name, **31.02 to 30.98 ms** for a partial name, **126.78 to 122.65 ms** for content in one directory, and **3.95 to 3.51 s** for content across the full fixture.
 - A populated format 11 backup kept the file's ID, direct tag, and locked Paint through restore, migration, rebuild, and compaction. The migrated Ledger found the current accented text and omitted the obsolete cached phrase.
 
+## Format 13 shared folder membership
+
+Windows release builds for formats 12 and 13 indexed the same 10,000 generated C files in 100 directories using `scripts/measure_lean_ledger.py`. The source files were 4,096 bytes each and used default filesystem tags.
+
+- The populated compacted Ledger shrank from **1,576,960 to 1,327,104 bytes**. The empty Ledger grew from **327,680 to 335,872 bytes**. Subtracting the empty Ledger, import growth fell from **1,249,280 to 991,232 bytes**, or **124.9280 to 99.1232 bytes per file**.
+- The new growth was **679,936 bytes** for object rows, **163,840** for native-ID lookup, **122,880** for directory membership and exact-path lookup, and **24,576** for the shared directory dictionary and its spelling index. These account for the full **991,232 bytes**, with zero reusable or unattributed bytes after compaction. Sparse fallback and parent-override indexes fit in their empty pages on this fixture.
+- The initial scan took **3.96 to 4.13 s** and the unchanged rescan took **3.96 to 3.60 s**. Median CLI time including startup was **29.90 to 28.05 ms** for tags by exact path and **29.86 to 28.72 ms** for the inherited-tag query.
+- The churn workload measured 250 exact-path lookups per mode. Shared folder lookup took **0.0246–0.0248 ms** per lookup. Reading native identity through the Windows filesystem and then looking up the row took **0.1653–0.1728 ms** using Mosh's native metadata reader. The hard-link test verifies that two paths with the same native ID can carry separate tags. A forced fingerprint collision still resolves each full spelling correctly.
+- The format 12 backup upgrade preserved the file ID, direct and inherited tags, and locked Paint through restore, rebuild, and compaction.
+
 ## Preview retrieval evaluation
 
 `cargo test --locked --release --test retrieval_quality -- --nocapture` evaluates 38 generated files and tracks tuned and held-out questions separately. The one tuned miss moved to rank one. On six held-out queries, top-1 accuracy, recall@3, and MRR each rose from **0.50 to 1.00**. Mean held-out latency rose from **1.65 to 2.06 ms**. The compacted database occupied **385,024 bytes**, or **10,132 bytes per file**, before and after within this small fixture's page allocation. The trial spent zero model tokens. A separate test rejects an improvement to the primary query when it demotes a known result in a control query.

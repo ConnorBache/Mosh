@@ -247,14 +247,22 @@ impl Mosh {
         let authority = organization::AUTHORITY;
         let visible = organization::VISIBLE;
         let sql = format!(
-            "{authority} SELECT o.id FROM object_keys k JOIN objects o ON o.key=k.key
-            WHERE k.tag_set=(SELECT tag_set FROM object_keys WHERE key=?3)
-            AND k.key<>?3 AND o.kind='file' AND o.missing=0 AND {visible} AND {read}
-            ORDER BY k.key LIMIT 32"
+            "{authority} SELECT o.id FROM tag_blocks b
+            JOIN json_each(mosh_block_slots(b.packed)) member
+            JOIN objects o ON o.key=b.block*4096+member.value
+            WHERE b.tag=?4 AND b.suggested=0
+            AND o.tag_set=(SELECT tag_set FROM objects WHERE key=?3)
+            AND o.key<>?3 AND o.kind='file' AND o.missing=0 AND {visible} AND {read}
+            ORDER BY o.key LIMIT 32"
         );
         let mut exact = self.db.prepare(&sql)?;
         for id in exact.query_map(
-            params![self.actor, std::path::MAIN_SEPARATOR_STR, key],
+            params![
+                self.actor,
+                std::path::MAIN_SEPARATOR_STR,
+                key,
+                seeds.first()
+            ],
             |r| r.get::<_, String>(0),
         )? {
             let id = id?;

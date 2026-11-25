@@ -6,7 +6,7 @@ Mosh is a local-first file explorer and searchable Ledger for Windows. It indexe
 
 Download the Windows x64 installer or CLI ZIP from [GitHub Releases](https://github.com/ConnorBache/Mosh/releases). The desktop application uses Microsoft Edge WebView2. The initial installer is unsigned. Compare its SHA-256 hash with the release checksum before running it.
 
-The published 0.2.0 preview uses Ledger format 8. Builds from this source tree use format 12 and upgrade earlier Ledgers on open. Back up your Ledger before upgrading. After upgrade, run `mosh ledger compact` to reclaim reusable pages. See the [preview release notes](docs/release-preview.md).
+The published 0.2.0 preview uses Ledger format 8. Builds from this source tree use format 13 and upgrade earlier Ledgers on open. Back up your Ledger before upgrading. After upgrade, run `mosh ledger compact` to reclaim reusable pages. See the [preview release notes](docs/release-preview.md).
 
 1. Open **Mosh** and choose **Index folder**. Select an ordinary directory.
 2. Browse the indexed folder. Double-click a folder to enter it or a file to open it with its Windows association. Select a row to inspect metadata, a text preview, tags, Paint, and available history.
@@ -67,7 +67,9 @@ Queries support uppercase `AND`, `OR`, and `NOT`, standalone parentheses, and an
 
 Each indexed file has an integer key, a filename and shared directory reference, and a filesystem file ID qualified by a shared volume reference when available. A creation time guards identity where the OS provides it. An eight-byte change stamp detects edits between scans. Mosh reads current size and timestamps from the filesystem. On Windows, a lookup by Mosh ID can recover a renamed file using its native ID when the new location is in scope and permitted. Paths support portable lookup and distinguish hard links.
 
-The Ledger stores packed tag sets and reverse lookups. Identical tag sets share a single record. Search checks stored filenames, relative paths, and Paint directly. It reads source text on demand after applying scope and access checks. Broad content queries may take longer than scoped queries. Existing `indexed-content:` expressions resolve to live content search.
+Tracked files share their physical parent through the directory record. One small directory index serves both child listing and exact-name matching. Exact lookup verifies the full filename after checking its two-byte fingerprint.
+
+The Ledger stores packed tag sets and reverse tag postings. Each shared set stores a count of its assignments. Search checks stored filenames, relative paths, and Paint directly. It reads source text on demand after applying scope and access checks. Broad content queries may take longer than scoped queries. Existing `indexed-content:` expressions resolve to live content search.
 
 Older Ledgers migrate on open and retain their tags, aliases, confidence, evidence, Paint, relationships, permissions, and history. Existing UUIDs resolve as aliases for compact IDs. Migration drops rebuildable text indexes. Run `mosh ledger compact` to reclaim those pages. `mosh doctor` reports per-table page usage and reusable space. The write-ahead log and temporary SQLite work files can use additional disk space during writes.
 

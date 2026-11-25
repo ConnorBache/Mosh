@@ -167,6 +167,38 @@ fn parent_prefix<'a>(path: &'a str, name: &str) -> Option<&'a str> {
         .filter(|prefix| prefix.ends_with(std::path::MAIN_SEPARATOR))
 }
 
+fn directory_prefix(path: &str) -> String {
+    if path.ends_with(std::path::MAIN_SEPARATOR) {
+        path.to_owned()
+    } else {
+        format!("{path}{}", std::path::MAIN_SEPARATOR)
+    }
+}
+
+pub(crate) fn parent_coll_key(db: &Connection, path: &str) -> rusqlite::Result<Option<i64>> {
+    db.prepare_cached(
+        "SELECT key FROM objects WHERE missing=0 AND kind_code=1 AND path_literal IS NOT NULL
+         AND mosh_path_key(path_literal)=mosh_path_key(?1) AND path_literal=?1",
+    )?
+    .query_row([path], |row| row.get(0))
+    .optional()
+}
+
+pub(crate) fn path_key(db: &Connection, path: &str) -> rusqlite::Result<Option<i64>> {
+    let name = Path::new(path).file_name().and_then(|name| name.to_str());
+    let folder = name.and_then(|name| parent_prefix(path, name));
+    db.prepare_cached(
+        "SELECT key FROM objects WHERE missing=0
+          AND path_folder=(SELECT id FROM path_folders WHERE prefix=?2)
+          AND mosh_name_key(name)=mosh_name_key(?3) AND name=?3
+         UNION ALL SELECT key FROM objects WHERE missing=0 AND path_literal IS NOT NULL
+          AND mosh_path_key(path_literal)=mosh_path_key(?1) AND path_literal=?1
+         LIMIT 1",
+    )?
+    .query_row(params![path, folder, name], |row| row.get(0))
+    .optional()
+}
+
 pub(crate) fn store_location<'a>(
     db: &Connection,
     path: &'a str,
@@ -180,9 +212,15 @@ pub(crate) fn store_location<'a>(
     if let Some(id) = lookup.query_row([prefix], |row| row.get(0)).optional()? {
         return Ok((Some(id), None));
     }
+    let coll = Path::new(path)
+        .parent()
+        .and_then(Path::to_str)
+        .map(|parent| parent_coll_key(db, parent))
+        .transpose()?
+        .flatten();
     let id = db
-        .prepare_cached("INSERT INTO path_folders(prefix) VALUES(?) RETURNING id")?
-        .query_row([prefix], |row| row.get(0))?;
+        .prepare_cached("INSERT INTO path_folders(prefix,coll_key) VALUES(?,?) RETURNING id")?
+        .query_row(params![prefix, coll], |row| row.get(0))?;
     Ok((Some(id), None))
 }
 
@@ -197,6 +235,33 @@ pub(crate) fn register(db: &Connection) -> Result<()> {
             .zip(name.as_deref())
             .and_then(|(p, name)| parent_prefix(p, name))
             .map(str::to_owned))
+    })?;
+    db.create_scalar_function("mosh_directory_prefix", 1, generated, |ctx| {
+        Ok(ctx
+            .get::<Option<String>>(0)?
+            .as_deref()
+            .map(directory_prefix))
+    })?;
+    db.create_scalar_function("mosh_basename", 1, generated, |ctx| {
+        Ok(ctx
+            .get::<Option<String>>(0)?
+            .as_deref()
+            .and_then(|path| Path::new(path).file_name())
+            .and_then(|name| name.to_str())
+            .map(str::to_owned))
+    })?;
+    db.create_scalar_function("mosh_name_key", 1, generated, |ctx| {
+        Ok(ctx
+            .get::<Option<String>>(0)?
+            .map(|name| blake3::hash(name.as_bytes()).as_bytes()[..2].to_vec()))
+    })?;
+    db.create_scalar_function("mosh_folder_coll", 1, generated, |ctx| {
+        let Some(folder) = ctx.get::<Option<i64>>(0)? else {
+            return Ok(None);
+        };
+        let db = unsafe { ctx.get_connection()? };
+        db.prepare_cached("SELECT coll_key FROM path_folders WHERE id=?")?
+            .query_row([folder], |row| row.get::<_, Option<i64>>(0))
     })?;
     db.create_scalar_function("mosh_expand_path", 3, generated, |ctx| {
         let folder: Option<i64> = ctx.get(0)?;
@@ -540,6 +605,40 @@ pub(crate) fn migrate(db: &Connection) -> Result<()> {
 mod upgrade_tests {
     use super::*;
     use crate::{Mosh, SearchOptions};
+
+    #[test]
+    fn filename_lookup_checks_spelling_after_a_shared_fingerprint() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path().join("sources");
+        fs::create_dir(&root)?;
+        let mut names = std::collections::HashMap::new();
+        let (a, b) = (0..=65_536)
+            .find_map(|number| {
+                let name = format!("unit-{number}.txt");
+                let hash = blake3::hash(name.as_bytes());
+                let fingerprint: [u8; 2] = hash.as_bytes()[..2].try_into().unwrap();
+                names
+                    .insert(fingerprint, name.clone())
+                    .map(|other| (other, name))
+            })
+            .expect("two names must share a two-byte fingerprint");
+        let a = root.join(a);
+        let b = root.join(b);
+        fs::write(&a, "first")?;
+        fs::write(&b, "second")?;
+        let mosh = Mosh::open(&fixture.path().join("ledger.sqlite3"))?;
+        assert_eq!(
+            mosh.scan(&root, &std::sync::atomic::AtomicBool::new(false))?
+                .errors,
+            0
+        );
+        let a = a.to_str().unwrap();
+        let b = b.to_str().unwrap();
+        assert_ne!(mosh.get(a)?.id, mosh.get(b)?.id);
+        assert_eq!(mosh.preview(a)?, "first");
+        assert_eq!(mosh.preview(b)?, "second");
+        Ok(())
+    }
 
     #[test]
     fn v2_keeps_aliases_access_links_and_history_through_restore() -> Result<()> {

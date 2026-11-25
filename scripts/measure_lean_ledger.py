@@ -3,6 +3,7 @@
 import argparse
 import json
 from pathlib import Path
+import sqlite3
 import statistics
 import subprocess
 import tempfile
@@ -35,6 +36,8 @@ def measure(cli, db, root, target):
     _, empty = call(cli, db, "doctor")
     scan_ms, scan = call(cli, db, "scan", str(root))
     assert scan["errors"] == 0, scan
+    _, rescan = call(cli, db, "scan", str(root))
+    assert rescan["errors"] == 0 and rescan["changed"] == 0, rescan
     call(cli, db, "ledger", "compact")
     _, populated = call(cli, db, "doctor")
     before, after = empty["storage"], populated["storage"]
@@ -64,6 +67,19 @@ def measure(cli, db, root, target):
             assert [item["id"] for item in hits] == [file_id], (name, hits)
             samples.append(duration)
         latency[name] = round(statistics.median(samples), 2)
+    path_samples = []
+    for _ in range(3):
+        duration, tags = call(cli, db, "tags", str(target))
+        assert any(tag["name"] == "source-code" for tag in tags)
+        path_samples.append(duration)
+    latency["tags_by_exact_path"] = round(statistics.median(path_samples), 2)
+    call(cli, db, "tag", "add", str(target.parent), "fixture-parent")
+    inherited_samples = []
+    for _ in range(3):
+        duration, hits = call(cli, db, "search", f"tag:fixture-parent AND name:{target.name}")
+        assert [item["id"] for item in hits] == [file_id], hits
+        inherited_samples.append(duration)
+    latency["inherited_tag"] = round(statistics.median(inherited_samples), 2)
     return {
         "empty_bytes": before["database_bytes"],
         "compacted_bytes": after["database_bytes"],
@@ -76,6 +92,7 @@ def measure(cli, db, root, target):
         "table_growth_bytes": {key: value for key, value in tables.items() if value},
         "scan_elapsed_ms": scan["elapsed_ms"],
         "scan_wall_ms": round(scan_ms, 2),
+        "unchanged_rescan_elapsed_ms": rescan["elapsed_ms"],
         "query_median_wall_ms": latency,
     }
 
@@ -92,9 +109,14 @@ def check_upgrade(before, after, home):
     _, old = call(before, old_db, "search", "name:current.txt")
     file_id = old[0]["id"]
     call(before, old_db, "tag", "add", file_id, "preserved-tag")
+    call(before, old_db, "tag", "add", str(directory), "preserved-parent")
     call(before, old_db, "paint", file_id, "--body", "Preserved annotation", "--lock")
-    _, cache = call(before, old_db, "ledger", "text-index", "--max-bytes", "131072")
-    assert cache["cached_files"] == 1, cache
+    with sqlite3.connect(old_db) as reader:
+        version = reader.execute("PRAGMA user_version").fetchone()[0]
+    reader.close()
+    if version < 12:
+        _, cache = call(before, old_db, "ledger", "text-index", "--max-bytes", "131072")
+        assert cache["cached_files"] == 1, cache
     call(before, old_db, "backup", str(saved_db))
     source.write_text("current résumé", encoding="utf-8")
     call(after, new_db, "restore", str(saved_db), str(new_db))
@@ -102,12 +124,14 @@ def check_upgrade(before, after, home):
     call(after, new_db, "ledger", "compact")
     _, obsolete = call(after, new_db, "search", "content:obsolete")
     _, current = call(after, new_db, "search", "content:resume AND direct-tag:preserved-tag")
+    _, inheriting = call(after, new_db, "search", "kind:file AND inherited-tag:preserved-parent")
     _, annotation = call(after, new_db, "paint", file_id)
     _, doctor = call(after, new_db, "doctor")
     assert not obsolete and [item["id"] for item in current] == [file_id]
+    assert [item["id"] for item in inheriting] == [file_id]
     assert annotation["body"] == "Preserved annotation" and annotation["locked"]
     assert doctor["ok"]
-    return {"current_content": True, "prior_cached_content_removed": True, "identity_and_annotations_preserved": True}
+    return {"current_content": True, "prior_content_excluded": True, "identity_and_annotations_preserved": True}
 
 
 def main():

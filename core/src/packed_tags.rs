@@ -601,7 +601,7 @@ impl<'a> Writer<'a> {
         Ok(())
     }
 
-    fn replace(&mut self, object: i64, old_id: Option<i64>, old: &Tags, tags: &Tags) -> Result<()> {
+    fn replace(&mut self, object: i64, old: &Tags, tags: &Tags) -> Result<()> {
         if old == tags {
             return Ok(());
         }
@@ -658,9 +658,6 @@ impl<'a> Writer<'a> {
         self.db
             .prepare_cached("UPDATE object_keys SET tag_set=? WHERE key=?")?
             .execute(params![set_id, object])?;
-        if let Some(old) = old_id {
-            self.db.prepare_cached("DELETE FROM tag_sets WHERE id=?1 AND NOT EXISTS(SELECT 1 FROM object_keys WHERE tag_set=?1)")?.execute([old])?;
-        }
         Ok(())
     }
 
@@ -683,7 +680,7 @@ impl<'a> Writer<'a> {
         origin: u8,
         value: Option<(f64, Option<&str>)>,
     ) -> Result<()> {
-        let (id, old) = read_set(self.db, object)?;
+        let (_, old) = read_set(self.db, object)?;
         let mut tags = old.clone();
         if let Some((confidence, evidence)) = value {
             ensure!(
@@ -706,11 +703,11 @@ impl<'a> Writer<'a> {
         if value.is_none() {
             require_file_tag(self.db, object, &tags)?;
         }
-        self.replace(object, id, &old, &tags)
+        self.replace(object, &old, &tags)
     }
 
     pub fn filesystem(&mut self, object: i64, ids: &[i64]) -> Result<()> {
-        let (id, old) = read_set(self.db, object)?;
+        let (_, old) = read_set(self.db, object)?;
         let mut tags = old.clone();
         tags.retain(|_, bits| {
             *bits &= !FILESYSTEM;
@@ -722,11 +719,11 @@ impl<'a> Writer<'a> {
         self.db
             .prepare_cached("DELETE FROM tag_details WHERE object_key=? AND origin=?")?
             .execute(params![object, FILESYSTEM])?;
-        self.replace(object, id, &old, &tags)
+        self.replace(object, &old, &tags)
     }
 
     pub fn invalidate_enrichment(&mut self, key: i64, previous_revision: i64) -> Result<()> {
-        let (id, old) = read_set(self.db, key)?;
+        let (_, old) = read_set(self.db, key)?;
         let mut tags = old.clone();
         tags.retain(|_, mask| {
             *mask &= !(AI | CONTEXTUAL);
@@ -759,7 +756,7 @@ impl<'a> Writer<'a> {
         self.db
             .prepare_cached("DELETE FROM tag_details WHERE object_key=? AND origin IN (?,?)")?
             .execute(params![key, AI, CONTEXTUAL])?;
-        self.replace(key, id, &old, &tags)
+        self.replace(key, &old, &tags)
     }
 
     pub fn retag(&mut self, from: i64, to: Option<i64>) -> Result<()> {
@@ -788,7 +785,7 @@ impl<'a> Writer<'a> {
             }
             for slot in members.slots() {
                 let object = block * BLOCK + slot as i64;
-                let (id, old) = read_set(self.db, object)?;
+                let (_, old) = read_set(self.db, object)?;
                 let Some(&bits) = old.get(&from) else {
                     anyhow::bail!("posting has no corresponding tag");
                 };
@@ -821,7 +818,7 @@ impl<'a> Writer<'a> {
                     .prepare_cached("DELETE FROM tag_details WHERE object_key=? AND tag=?")?
                     .execute(params![object, from])?;
                 require_file_tag(self.db, object, &tags)?;
-                self.replace(object, id, &old, &tags)?;
+                self.replace(object, &old, &tags)?;
             }
             self.flush()?;
             after = block;
@@ -860,7 +857,7 @@ pub fn migrate(db: &Connection) -> Result<()> {
     while let Some(row) = rows.next()? {
         let key = row.get(0)?;
         if let Some(old) = current.filter(|previous| *previous != key) {
-            writer.replace(old, None, &Tags::new(), &tags)?;
+            writer.replace(old, &Tags::new(), &tags)?;
             tags.clear();
         }
         current = Some(key);
@@ -873,7 +870,7 @@ pub fn migrate(db: &Connection) -> Result<()> {
         }
     }
     if let Some(key) = current {
-        writer.replace(key, None, &Tags::new(), &tags)?;
+        writer.replace(key, &Tags::new(), &tags)?;
     }
     drop(rows);
     drop(statement);
@@ -1040,8 +1037,8 @@ mod tests {
                 [file.id],
                 |r| r.get(0),
             )?;
-            let (old, before) = read_set(&tx, key)?;
-            writer.replace(key, old, &before, &tags)?;
+            let (_, before) = read_set(&tx, key)?;
+            writer.replace(key, &before, &tags)?;
             keys.push(key);
         }
         writer.flush()?;

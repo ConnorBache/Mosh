@@ -31,7 +31,7 @@ fn measure_densities(mosh: &Mosh, files: i64, source_bytes: i64) -> Result<()> {
             }
             let mut writer = Writer::new(&tx);
             for key in batch {
-                let (old_set, old) = read_set(&tx, key)?;
+                let (_, old) = read_set(&tx, key)?;
                 let mut tags = old
                     .iter()
                     .filter(|(tag, _)| **tag < vocabulary[0])
@@ -48,7 +48,7 @@ fn measure_densities(mosh: &Mosh, files: i64, source_bytes: i64) -> Result<()> {
                     tags.entry(vocabulary[(entropy >> 32) as usize % vocabulary.len()])
                         .or_insert(USER);
                 }
-                writer.replace(key, old_set, &old, &tags)?;
+                writer.replace(key, &old, &tags)?;
                 last = key;
             }
             writer.flush()?;
@@ -285,48 +285,49 @@ fn storage_churn_workload() -> Result<()> {
             let lookup_paths = (0..250)
                 .map(|n| dunce::canonicalize(path_for((n * 7) % count)))
                 .collect::<std::io::Result<Vec<_>>>()?;
-            let index_read = |hash: bool| -> Result<f64> {
-                let sql = if hash {
-                    "SELECT id FROM objects WHERE missing=0 AND path IS NOT NULL AND
-                    mosh_path_key(path)=mosh_path_key(?1) AND path=?1"
-                } else {
-                    "SELECT id FROM objects WHERE missing=0 AND path=?1"
-                };
-                let mut query = mosh.db.prepare(sql)?;
+            let compact_lookup = {
                 let time = Instant::now();
                 for path in &lookup_paths {
-                    assert!(
-                        !query
-                            .query_row([path.to_str().unwrap()], |r| r.get::<_, String>(0))?
-                            .is_empty()
-                    );
+                    assert!(crate::lean::path_key(&mosh.db, path.to_str().unwrap())?.is_some());
                 }
-                Ok(time.elapsed().as_secs_f64() * 4.0)
+                time.elapsed().as_secs_f64() * 4.0
             };
-            let compact_lookup = index_read(true)?;
+            let native_lookup = {
+                let mut stmt = mosh.db.prepare(
+                    "SELECT key FROM objects WHERE missing=0 AND native_volume=? AND native_ref=? AND path=?",
+                )?;
+                let time = Instant::now();
+                for path in &lookup_paths {
+                    let metadata = fs::symlink_metadata(path)?;
+                    let native = crate::fsmeta::native(path, &metadata);
+                    let (volume, reference) =
+                        crate::fsmeta::native_parts(&mosh.db, native.id.as_deref())?;
+                    let _: i64 = stmt
+                        .query_row(params![volume, reference, path.to_str()], |row| row.get(0))?;
+                }
+                time.elapsed().as_secs_f64() * 4.0
+            };
+            println!(
+                "path lookup {kind}: shared locator {compact_lookup:.4} ms, native including OS lookup {native_lookup:.4} ms"
+            );
             let mut legacy = Value::Null;
             if mode == 0 {
-                let path_update: String = mosh.db.query_row(
-                    "SELECT sql FROM sqlite_schema WHERE name='unique_live_path_update'",
-                    [],
-                    |row| row.get(0),
-                )?;
-                mosh.db.execute_batch("DROP TRIGGER unique_live_path_insert; DROP TRIGGER unique_live_path_update;
-                    DROP INDEX live_path_key; CREATE UNIQUE INDEX live_path ON objects(path) WHERE missing=0 AND path IS NOT NULL;
-                    DROP INDEX object_git; CREATE INDEX object_git ON objects(git_root,git_status);
-                    DROP INDEX object_parent_key;
-                    CREATE INDEX object_parent ON objects(parent_key,missing,name COLLATE NOCASE);
-                    UPDATE file_tiers SET assessor='filesystem' WHERE assessor='f';")?;
-                mosh.compact()?;
-                legacy = json!({"storage":mosh.storage_usage()?,"exact_path_mean_ms":index_read(false)?});
                 mosh.db.execute_batch(
-                    &include_str!("ledger_v6.sql").replace("DROP INDEX file_tier_rank;", "")
-                        .replace("CREATE INDEX object_parent ON objects(parent,missing,name COLLATE NOCASE);",
-                                 "CREATE INDEX object_parent_key ON objects(parent_key) WHERE missing=0;"),
+                    "CREATE INDEX live_path ON objects(path) WHERE missing=0 AND path IS NOT NULL;",
                 )?;
-                mosh.db
-                    .execute_batch("DROP TRIGGER unique_live_path_update;")?;
-                mosh.db.execute_batch(&path_update)?;
+                mosh.compact()?;
+                let exact_ms = {
+                    let mut query = mosh
+                        .db
+                        .prepare("SELECT key FROM objects WHERE missing=0 AND path=?1")?;
+                    let time = Instant::now();
+                    for path in &lookup_paths {
+                        let _: i64 = query.query_row([path.to_str()], |row| row.get(0))?;
+                    }
+                    time.elapsed().as_secs_f64() * 4.0
+                };
+                legacy = json!({"storage":mosh.storage_usage()?,"exact_path_mean_ms":exact_ms});
+                mosh.db.execute_batch("DROP INDEX live_path;")?;
             }
             let vocabulary = (0..2048)
                 .map(|n| crate::organization::dictionary_id(&mosh.db, &format!("load:{n:04}")))
@@ -341,7 +342,7 @@ fn storage_churn_workload() -> Result<()> {
                 drop(statement);
                 let mut writer = Writer::new(&tx);
                 for (i, key) in keys.into_iter().enumerate() {
-                    let (id, before) = read_set(&tx, key)?;
+                    let (_, before) = read_set(&tx, key)?;
                     let mut tags: Tags = before
                         .iter()
                         .filter(|(tag, _)| **tag < vocabulary[0])
@@ -365,7 +366,7 @@ fn storage_churn_workload() -> Result<()> {
                         tags.entry(vocabulary[(rng >> 32) as usize % vocabulary.len()])
                             .or_insert(USER);
                     }
-                    writer.replace(key, id, &before, &tags)?;
+                    writer.replace(key, &before, &tags)?;
                 }
                 writer.flush()?;
                 tx.commit()?;

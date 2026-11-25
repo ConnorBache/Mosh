@@ -1,7 +1,7 @@
 use crate::{Mosh, canonical, event, fsmeta, now, path_text, prefix};
 use anyhow::{Context, Result, ensure};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 use serde::Serialize;
 use serde_json::json;
 use std::{
@@ -131,13 +131,12 @@ fn identity(
     native_ref: Option<&[u8]>,
     created: Option<i64>,
 ) -> Result<Option<Previous>> {
-    let existing = db
-        .prepare_cached(&format!(
-            "SELECT {STAMP} FROM objects WHERE missing=0 AND path IS NOT NULL
-                AND mosh_path_key(path)=mosh_path_key(?1) AND path=?1"
-        ))?
-        .query_row([path], previous)
-        .optional()?;
+    let existing = crate::lean::path_key(db, path)?
+        .map(|key| {
+            db.prepare_cached(&format!("SELECT {STAMP} FROM objects WHERE key=?"))?
+                .query_row([key], previous)
+        })
+        .transpose()?;
     if let Some(existing) = existing {
         let birth_changed = existing.created.zip(created).is_some_and(|(a, b)| a != b);
         let id_changed = existing
@@ -220,19 +219,6 @@ fn index_one(
     let is_reparse = fsmeta::reparse(&meta);
     let kind = if meta.is_dir() { "coll" } else { "file" };
     let extension = crate::lean::file_extension(name, kind == "file");
-    let parent = path
-        .parent()
-        .and_then(Path::to_str)
-        .map(|parent| {
-            db.prepare_cached(
-                "SELECT key FROM objects WHERE missing=0 AND path IS NOT NULL
-                AND mosh_path_key(path)=mosh_path_key(?1) AND path=?1",
-            )?
-            .query_row([parent], |r| r.get::<_, i64>(0))
-            .optional()
-        })
-        .transpose()?
-        .flatten();
     let native = fsmeta::native(path, &meta);
     let (size, modified, created) = fsmeta::revision_stamp(&meta);
     let size: i64 = if kind == "file" {
@@ -268,9 +254,19 @@ fn index_one(
         .flatten()
         .and_then(|p| p.to_str().map(str::to_owned));
     let (folder, literal) = crate::lean::store_location(db, key, name, kind == "file")?;
-    db.prepare_cached("INSERT INTO objects(key,kind_code,path_literal,parent_key,name,path_folder,scan_stamp,created,native_volume,native_ref,reparse,link_target)
+    let parent = if folder.is_none() {
+        path.parent()
+            .and_then(Path::to_str)
+            .map(|parent| crate::lean::parent_coll_key(db, parent))
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
+    db.prepare_cached("INSERT INTO objects(key,kind_code,path_literal,parent_override,name,path_folder,scan_stamp,created,native_volume,native_ref,reparse,link_target)
         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
-        ON CONFLICT(key) DO UPDATE SET path_literal=?3,parent_key=?4,name=?5,path_folder=?6,scan_stamp=?7,
+        ON CONFLICT(key) DO UPDATE SET path_literal=?3,name=?5,path_folder=?6,scan_stamp=?7,
+        parent_override=CASE WHEN path_folder IS ?6 AND ?6 IS NOT NULL THEN parent_override ELSE ?4 END,
         created=coalesce(?8,created),native_volume=coalesce(?9,native_volume),native_ref=coalesce(?10,native_ref),
         reparse=?11,link_target=?12,revision=revision+?13,missing=0,
         hash=CASE WHEN ?13=1 THEN NULL ELSE hash END")?
@@ -286,8 +282,17 @@ fn index_one(
         db.prepare_cached("INSERT INTO owners VALUES(?,?)")?
             .execute(params![object_key, actor])?;
         let (low, high) = prefix(key);
-        db.prepare_cached("UPDATE objects SET parent_key=?1 WHERE parent_key IS NULL AND path>=?2 AND path<?3 AND missing=0
-            AND instr(substr(path,length(?2)+1),?4)=0")?.execute(params![object_key,low,high,std::path::MAIN_SEPARATOR_STR])?;
+        db.prepare_cached(
+            "UPDATE objects SET parent_override=?1 WHERE parent_override IS NULL
+            AND path_literal IS NOT NULL AND path_literal>=?2 AND path_literal<?3 AND missing=0
+            AND instr(substr(path_literal,length(?2)+1),?4)=0",
+        )?
+        .execute(params![
+            object_key,
+            low,
+            high,
+            std::path::MAIN_SEPARATOR_STR
+        ])?;
     }
     if new || renamed {
         let ids = deterministic_tags(&extension, kind, fsmeta::mime(Some(&extension)))

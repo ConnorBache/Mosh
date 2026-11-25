@@ -23,7 +23,9 @@ fn page_group(name: &str) -> &'static str {
         "file_tiers" | "file_tier_rank" | "tiers" => "tier_records",
         "native_volumes" | "sqlite_autoindex_native_volumes_1" => "native_volume_dictionary",
         "legacy_public_id" => "legacy_object_aliases",
-        "path_folders" | "sqlite_autoindex_path_folders_1" => "path_directory_dictionary",
+        "path_folders" | "sqlite_autoindex_path_folders_1" | "path_folders_coll" => {
+            "path_directory_dictionary"
+        }
         "live_path" | "live_path_key" | "object_path" => "file_indexes",
         "text_cached" => "source_text_cache",
         "paint" => "paint",
@@ -398,9 +400,16 @@ impl Mosh {
             |r| r.get(0),
         )?;
         let storage = self.storage_usage()?;
+        let bad_tag_owners: i64 = self.db.query_row(
+            "SELECT count(*) FROM tag_sets s LEFT JOIN
+             (SELECT tag_set,count(*) n FROM objects WHERE tag_set IS NOT NULL GROUP BY tag_set) counts
+             ON s.id=counts.tag_set WHERE s.owners<>coalesce(counts.n,0) OR s.owners=0",
+            [], |row| row.get(0)
+        )?;
         Ok(
-            json!({"ok":integrity==["ok"]&&foreign_violations==0&&forward==reverse,"integrity":integrity,
+            json!({"ok":integrity==["ok"]&&foreign_violations==0&&forward==reverse&&bad_tag_owners==0,"integrity":integrity,
             "foreign_key_violations":foreign_violations,"objects":active,
+            "tag_owner_count_errors":bad_tag_owners,
             "pending_recovery_steps":uncertain,"database_bytes":page_count*page_size,"reusable_bytes":reusable*page_size,
             "tag_storage_bytes":tag_pages,"confirmed_assignments":forward,"confirmed_postings":reverse,"storage":storage}),
         )

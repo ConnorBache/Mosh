@@ -534,6 +534,15 @@ fn duplicates_account_for_hardlinks_and_backup_round_trips() -> Result<()> {
     fs::copy(&file, fixture.root.join("other.txt"))?;
     fs::write(fixture.root.join("different.txt"), vec![b'b'; 5040])?;
     fixture.scan()?;
+    let linked = fixture.root.join("linked.txt");
+    let original_entry = fixture.mosh.get(file.to_str().unwrap())?;
+    let linked_entry = fixture.mosh.get(linked.to_str().unwrap())?;
+    assert_eq!(original_entry.native_id, linked_entry.native_id);
+    assert_ne!(original_entry.id, linked_entry.id);
+    fixture
+        .mosh
+        .tag(&linked_entry.id, "this-link-only", true, 1.0)?;
+    assert_eq!(fixture.search("direct-tag:this-link-only")?, ["linked.txt"]);
     let report = fixture
         .mosh
         .duplicates(Some(&fixture.root), &AtomicBool::new(false))?;

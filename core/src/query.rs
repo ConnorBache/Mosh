@@ -256,14 +256,22 @@ impl Parser {
                     JOIN object_keys k ON k.key=b.block*4096+p.value WHERE b.suggested={suggested}
                     AND b.tag IN(SELECT id FROM tag_dictionary WHERE name={id} UNION SELECT tag FROM tag_aliases WHERE alias={id})");
                 if matches!(field, "tag" | "inherited-tag") {
+                    // Drive each branch from a matched parent so SQLite can seek directly
+                    // into the folder and override indexes during recursive expansion.
+                    let children = "SELECT c.key FROM matched m CROSS JOIN objects c
+                        WHERE c.parent_override=m.id AND c.missing=0
+                        UNION SELECT c.key FROM matched m CROSS JOIN path_folders f CROSS JOIN objects c
+                        WHERE f.coll_key=m.id AND c.path_folder=f.id AND c.missing=0 AND c.parent_override IS NULL";
                     let selection = if field == "tag" {
                         "SELECT id FROM matched"
                     } else {
-                        "SELECT o2.key FROM objects o2 JOIN matched m2 ON o2.parent_key=m2.id WHERE o2.missing=0"
+                        children
                     };
-                    format!("({readable} AND o.key IN(WITH RECURSIVE matched(id) AS ({direct}
-                        UNION SELECT child.key FROM objects child JOIN matched m ON child.parent_key=m.id WHERE child.missing=0)
-                        {selection}))")
+                    format!(
+                        "({readable} AND o.key IN(WITH RECURSIVE matched(id) AS ({direct}
+                        UNION {children})
+                        {selection}))"
+                    )
                 } else {
                     format!("({readable} AND o.key IN({direct}))")
                 }
@@ -603,7 +611,7 @@ impl Mosh {
             let selected = self.find(parent)?;
             let id = parser.bind(selected.key);
             scope = format!(
-                "AND (o.parent_key={id} OR o.key IN(SELECT target FROM edges WHERE container={id} AND kind<>'related')"
+                "AND (o.key IN(SELECT child FROM physical_children WHERE parent={id}) OR o.key IN(SELECT target FROM edges WHERE container={id} AND kind<>'related')"
             );
             if selected.kind == "marriage" {
                 let mut statement = self.db.prepare("SELECT query FROM collection_queries WHERE container=? ORDER BY query LIMIT 40")?;

@@ -499,7 +499,7 @@ impl Mosh {
         )?;
         let cycle: bool = tx.query_row("WITH RECURSIVE reachable(id) AS (
             SELECT ?1 UNION SELECT e.target FROM edges e JOIN reachable r ON e.container=r.id WHERE e.kind<>'related'
-            UNION SELECT o.key FROM objects o JOIN reachable r ON o.parent_key=r.id WHERE o.missing=0
+            UNION SELECT c.child FROM physical_children c JOIN reachable r ON c.parent=r.id
         ) SELECT EXISTS(SELECT 1 FROM reachable WHERE id=?2)",params![target.key,container.key],|r|r.get(0))?;
         ensure!(
             kind == "related" || !cycle,

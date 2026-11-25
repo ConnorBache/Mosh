@@ -39,7 +39,7 @@ pub struct Mosh {
     actor: String,
 }
 
-const LEDGER_VERSION: i64 = 12;
+const LEDGER_VERSION: i64 = 13;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Object {
@@ -255,6 +255,17 @@ impl Mosh {
             }
             if current <= 11 {
                 lean::slim_files(&tx)?;
+            }
+            if current <= 12 {
+                tx.execute_batch(include_str!("ledger_v13.sql"))?;
+                let violations: i64 =
+                    tx.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                        row.get(0)
+                    })?;
+                ensure!(
+                    violations == 0,
+                    "folder migration found {violations} foreign key violations"
+                );
                 tx.pragma_update(None, "user_version", LEDGER_VERSION)?;
             }
             tx.commit()?;
@@ -372,14 +383,15 @@ impl Mosh {
             None => {
                 let path = indexed_path(Path::new(reference)).ok();
                 let key = path.as_deref().and_then(Path::to_str).unwrap_or(reference);
-                self.db
-                    .query_row(
-                        "SELECT * FROM objects WHERE missing=0 AND path IS NOT NULL
-                         AND mosh_path_key(path)=mosh_path_key(?1) AND path=?1",
-                        [key],
-                        object,
-                    )
-                    .optional()?
+                lean::path_key(&self.db, key)?
+                    .map(|key| {
+                        self.db
+                            .prepare_cached("SELECT * FROM objects WHERE key=? AND missing=0")?
+                            .query_row([key], object)
+                            .optional()
+                    })
+                    .transpose()?
+                    .flatten()
             }
         };
         match selected {
