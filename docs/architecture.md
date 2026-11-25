@@ -22,9 +22,11 @@ The previous Ledger copied the full path into its exact-path index. The current 
 
 The file record still contains one full path. Reconstructing it from directory keys would need a coordinated migration of filesystem operations, boundary checks, and path filters. Dropping name and path postings would remove indexed phrase search. These are the largest remaining fixed-cost candidates. The preview retains those behaviors and reports their measured cost.
 
-Identical tag sets share an immutable packed record. Mosh chooses among gap-encoded IDs and runs of consecutive IDs. Origin flags retain independent sources and can share a default value for the set. Confidence and evidence departures from the defaults occupy a sparse table.
+An arbitrary set of 1,000 members from a 2,048-tag vocabulary has about 2,041 bits of information, or 255 bytes, before origin and evidence. A dense forward bitmap for that range uses at most 256 membership bytes plus its header and any origin overrides. The reverse index adds another representation to support fast intersections. For 100 members from the same vocabulary the corresponding information bound is about 71 bytes, so the writer can keep smaller sparse encodings. Shared tag sets can amortize their forward representation across all files that reference them.
 
-Reverse lookups group 4,096 object keys at a time and choose the smallest delta list, run list, 512-byte bitmap, or full-block marker. Confirmed and suggested memberships have independent blocks. Intersections of direct tag filters combine blocks before enumerating objects. Inherited queries expand through physical parents.
+Identical tag sets share an immutable packed record. Mosh chooses the smallest representation among gap-encoded IDs, runs of consecutive IDs, and a bitmap over a dense range of IDs. Origin flags retain independent sources and can share a default value for the set. Confidence and evidence departures from the defaults occupy a sparse table.
+
+Reverse lookups group 4,096 object keys at a time and choose the smallest delta list, run list, bitmap, or full-block marker. A bitmap can omit its leading and trailing zero bytes. Confirmed and suggested memberships have independent blocks. Intersections of direct tag filters combine blocks before enumerating objects. Inherited queries expand through physical parents.
 
 Tag-set references and affected reverse blocks update in one SQLite transaction. Reverse blocks can be rebuilt from the tag sets. Bulk Cleave tagging writes one audit event and a packed list of object keys, which individual object histories can query.
 

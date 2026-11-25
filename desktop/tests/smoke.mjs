@@ -11,43 +11,44 @@ import { chromium } from 'playwright-core'
 const [application, cli, legacy] = process.argv.slice(2).map((path) => resolve(path))
 assert(application && cli, 'Pass the installed desktop executable and the CLI executable')
 const fixture = await mkdtemp(join(tmpdir(), 'mosh-desktop-test-'))
-const root = join(fixture, 'Sample workspace')
-const db = join(fixture, 'ledger.sqlite3')
-await mkdir(root)
-await mkdir(join(root, 'Archive'))
-await writeFile(join(root, 'Orbit.md'), 'A test report about lunar navigation.')
-await writeFile(join(root, 'Copy.md'), 'A test report about lunar navigation.')
-await writeFile(join(root, 'Archive', 'Notes.txt'), 'A résumé about altitude.')
-const oldDb = legacy ? join(fixture, 'old-source.sqlite3') : db
-execFileSync(legacy ?? cli, ['--db', oldDb, 'scan', root], { windowsHide: true })
-execFileSync(legacy ?? cli, ['--db', oldDb, 'tag', 'add', join(root, 'Orbit.md'), 'space-research'], { windowsHide: true })
 const version = (path) => {
   const sqlite = new DatabaseSync(path, { readOnly: true })
   try { return sqlite.prepare('PRAGMA user_version').get().user_version }
   finally { sqlite.close() }
 }
-if (legacy) {
-  assert.equal(version(oldDb), 1)
-  execFileSync(legacy, ['--db', oldDb, 'backup', db], { windowsHide: true })
-  assert.equal(version(db), 1)
-}
-
-const server = createServer()
-server.listen(0, '127.0.0.1')
-await once(server, 'listening')
-const port = server.address().port
-await new Promise((done) => server.close(done))
-const userData = join(fixture, 'WebView')
-const webviewLog = join(fixture, 'webview.log')
-const app = spawn(application, [], {
-  env: { ...process.env, MOSH_DB: db, WEBVIEW2_USER_DATA_FOLDER: userData,
-    WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: '--remote-debugging-port=' + port + ' --enable-logging --log-file="' + webviewLog + '"' },
-  stdio: 'inherit',
-})
+let app
 let browser
-let lastError
-const deadline = Date.now() + 35000
 try {
+  const root = join(fixture, 'Sample workspace')
+  const db = join(fixture, 'ledger.sqlite3')
+  await mkdir(root)
+  await mkdir(join(root, 'Archive'))
+  await writeFile(join(root, 'Orbit.md'), 'A test report about lunar navigation.')
+  await writeFile(join(root, 'Copy.md'), 'A test report about lunar navigation.')
+  await writeFile(join(root, 'Archive', 'Notes.txt'), 'A résumé about altitude.')
+  const oldDb = legacy ? join(fixture, 'old-source.sqlite3') : db
+  execFileSync(legacy ?? cli, ['--db', oldDb, 'scan', root], { windowsHide: true })
+  execFileSync(legacy ?? cli, ['--db', oldDb, 'tag', 'add', join(root, 'Orbit.md'), 'space-research'], { windowsHide: true })
+  if (legacy) {
+    assert.equal(version(oldDb), 1)
+    execFileSync(legacy, ['--db', oldDb, 'backup', db], { windowsHide: true })
+    assert.equal(version(db), 1)
+  }
+
+  const server = createServer()
+  server.listen(0, '127.0.0.1')
+  await once(server, 'listening')
+  const port = server.address().port
+  await new Promise((done) => server.close(done))
+  const userData = join(fixture, 'WebView')
+  const webviewLog = join(fixture, 'webview.log')
+  app = spawn(application, [], {
+    env: { ...process.env, MOSH_DB: db, WEBVIEW2_USER_DATA_FOLDER: userData,
+      WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: '--remote-debugging-port=' + port + ' --enable-logging --log-file="' + webviewLog + '"' },
+    stdio: 'inherit',
+  })
+  let lastError
+  const deadline = Date.now() + 35000
   while (!browser && Date.now() < deadline) {
     if (app.exitCode !== null) throw new Error('The desktop executable exited before opening its WebView')
     try { browser = await chromium.connectOverCDP('http://127.0.0.1:' + port, { timeout: 1500 }) }
@@ -66,7 +67,7 @@ try {
   await page.locator('.sidebar').getByRole('button', { name: 'Sample workspace', exact: true }).click()
   await page.getByRole('heading', { name: 'Sample workspace' }).waitFor()
   if (legacy) {
-    assert.equal(version(db), 7)
+    assert.equal(version(db), 8)
     assert.equal(version(oldDb), 1)
   }
   await page.getByRole('button', { name: 'Orbit.md', exact: true }).click()
@@ -168,7 +169,7 @@ try {
   console.log(`Windows desktop scope, Individuality, and filesystem smoke passed${legacy ? ' on an upgraded format 1 copy' : ''}.`)
 } finally {
   await browser?.close().catch(() => {})
-  if (app.exitCode === null) {
+  if (app?.exitCode === null && app.pid && app.signalCode === null) {
     const exited = once(app, 'exit')
     app.kill()
     await exited

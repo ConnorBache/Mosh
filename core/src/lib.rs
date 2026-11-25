@@ -38,7 +38,7 @@ pub struct Mosh {
     actor: String,
 }
 
-const LEDGER_VERSION: i64 = 7;
+const LEDGER_VERSION: i64 = 8;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Object {
@@ -214,6 +214,9 @@ impl Mosh {
             if locked_version < 7 {
                 tx.execute_batch(include_str!("nested.sql"))?;
                 tx.execute("INSERT INTO metadata VALUES('mosh_id',?)", [uuid()])?;
+            }
+            if (2..8).contains(&locked_version) {
+                packed_tags::repack_dense(&tx)?;
             }
             tx.pragma_update(None, "user_version", LEDGER_VERSION)?;
             tx.commit()?;

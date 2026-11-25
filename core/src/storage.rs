@@ -15,20 +15,27 @@ fn page_group(name: &str) -> &'static str {
     match name {
         "objects"
         | "object_keys"
+        | "legacy_object_ids"
         | "sqlite_autoindex_objects_1"
         | "sqlite_autoindex_object_keys_1" => "file_records",
-        "audit" | "object_audit" => "audit_history",
+        "audit" | "object_audit" | "tag_audit_members" => "audit_history",
+        "tag_history" | "tag_history_tag" | "tag_history_object" => "vocabulary_history",
         "file_tiers" | "file_tier_rank" | "tiers" => "tier_records",
         "live_path" | "live_path_key" | "object_path" => "file_indexes",
         "text_cached" => "source_text_cache",
-        "paint"
-        | "embeddings"
+        "paint" => "paint",
+        "embeddings"
         | "vectors_model"
         | "retrievals"
         | "retrieval_feedback"
         | "passages"
         | "passage_relation"
+        | "passage_tags"
+        | "tag_passages"
         | "sqlite_autoindex_passages_1"
+        | "sqlite_autoindex_retrieval_feedback_1"
+        | "recommendations"
+        | "coll_ai_policy"
         | "coverage" => "optional_intelligence",
         _ if name.starts_with("object_") => "file_indexes",
         _ if name.starts_with("ledger_") => "name_path_search",

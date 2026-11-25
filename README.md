@@ -6,7 +6,7 @@ Mosh is a local-first file explorer and searchable Ledger for Windows. It indexe
 
 Download the Windows x64 installer or CLI ZIP from [GitHub Releases](https://github.com/ConnorBache/Mosh/releases). The desktop application uses Microsoft Edge WebView2. The initial installer is unsigned. Compare its SHA-256 hash with the release checksum before running it.
 
-The 0.2.0 preview uses Ledger format 7 with compact file identifiers, packed tags, nested Mosh boundaries, and intelligence features. Back up your Ledger before opening it with the newer build. See the [preview release notes](docs/release-preview.md).
+The 0.2.0 preview uses Ledger format 8 with compact file identifiers, packed tags, nested Mosh boundaries, and intelligence features. Back up your Ledger before opening it with the newer build. See the [preview release notes](docs/release-preview.md).
 
 1. Open **Mosh** and choose **Index folder**. Select an ordinary directory.
 2. Browse the indexed folder. Double-click a folder to enter it or a file to open it with its Windows association. Select a row to inspect metadata, a text preview, tags, Paint, and available history.

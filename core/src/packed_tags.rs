@@ -20,6 +20,7 @@ const BLOCK: i64 = 4096;
 const BUFFERED_BLOCKS: usize = 4096;
 const SET_GAPS: u8 = 128;
 const SET_RUNS: u8 = 129;
+const SET_BITMAP: u8 = 130;
 type Tags = BTreeMap<i64, u8>;
 type BlockKey = (i64, bool, i64);
 
@@ -123,39 +124,84 @@ fn pack_set(tags: &Tags) -> Vec<u8> {
     if runs.len() < packed.len() {
         packed = runs;
     }
+
+    let first = *tags.first_key_value().unwrap().0;
+    let last = *tags.last_key_value().unwrap().0;
+    let byte_count = (last - first) as u64 / 8 + 1;
+    let mut bitmap = vec![SET_BITMAP, default];
+    push_num(&mut bitmap, first as u64);
+    push_num(&mut bitmap, byte_count);
+    if byte_count < packed.len() as u64 {
+        let start = bitmap.len();
+        let end = start + byte_count as usize;
+        if end + overrides.len() < packed.len() {
+            bitmap.resize(end, 0);
+            for &tag in tags.keys() {
+                let offset = (tag - first) as u64;
+                bitmap[start + (offset / 8) as usize] |= 1 << (offset % 8);
+            }
+            bitmap.extend_from_slice(&overrides);
+            packed = bitmap;
+        }
+    }
     packed
 }
 
 fn unpack_set(packed: &[u8]) -> Result<Tags> {
     let (&common, mut tail) = packed.split_first().context("missing tag-set header")?;
-    if matches!(common, 32 | 33 | SET_GAPS | SET_RUNS) {
+    if matches!(common, 32 | 33 | SET_GAPS | SET_RUNS | SET_BITMAP) {
         let (&default, remaining) = tail.split_first().context("missing default tag origin")?;
         ensure!((1..128).contains(&default), "invalid default tag origin");
         tail = remaining;
-        let count = pop_num(&mut tail)?;
-        ensure!(count > 0, "packed tag count must be positive");
         let mut entries = Vec::new();
-        let mut last = 0;
-        while entries.len() < count as usize {
-            let first = add_gap(last, &mut tail)?;
-            let length = if matches!(common, 33 | SET_RUNS) {
-                pop_num(&mut tail)?
-            } else {
-                1
-            };
+        if common == SET_BITMAP {
+            let first = pop_num(&mut tail)?;
+            let len = usize::try_from(pop_num(&mut tail)?)?;
+            let (map, rest) = tail.split_at_checked(len).context("truncated tag bitmap")?;
             ensure!(
-                first > last && length > 0 && length <= count - entries.len() as u64,
-                "invalid tag run"
+                first > 0
+                    && map.first().is_some_and(|b| b & 1 != 0)
+                    && map.last().is_some_and(|b| *b != 0),
+                "invalid tag bitmap"
             );
-            last = first.checked_add(length - 1).context("tag run overflow")?;
-            ensure!(last <= i64::MAX as u64, "tag ID out of range");
-            entries.try_reserve(usize::try_from(length)?)?;
-            entries.extend((first..=last).map(|tag| (tag as i64, default)));
+            tail = rest;
+            for (index, &byte) in map.iter().enumerate() {
+                let mut bits = byte;
+                while bits != 0 {
+                    let offset = index as u64 * 8 + u64::from(bits.trailing_zeros());
+                    let tag = first.checked_add(offset).context("tag bitmap overflow")?;
+                    entries.push((i64::try_from(tag)?, default));
+                    bits &= bits - 1;
+                }
+            }
+        } else {
+            let count = pop_num(&mut tail)?;
+            ensure!(count > 0, "packed tag count must be positive");
+            let mut last = 0;
+            while (entries.len() as u64) < count {
+                let first = add_gap(last, &mut tail)?;
+                let length = if matches!(common, 33 | SET_RUNS) {
+                    pop_num(&mut tail)?
+                } else {
+                    1
+                };
+                ensure!(
+                    first > last && length > 0 && length <= count - entries.len() as u64,
+                    "invalid tag run"
+                );
+                last = first.checked_add(length - 1).context("tag run overflow")?;
+                ensure!(last <= i64::MAX as u64, "tag ID out of range");
+                entries.try_reserve(usize::try_from(length)?)?;
+                entries.extend((first..=last).map(|tag| (tag as i64, default)));
+            }
         }
         let mut after = 0;
         while !tail.is_empty() {
             let index = add_gap(after, &mut tail)?;
-            ensure!(index < count, "tag origin override exceeds set");
+            ensure!(
+                index < entries.len() as u64,
+                "tag origin override exceeds set"
+            );
             let (&bits, rest) = tail.split_first().context("missing tag origin override")?;
             ensure!((1..128).contains(&bits), "invalid tag origin override");
             entries[index as usize].1 = bits;
@@ -217,6 +263,16 @@ impl Block {
             b'B' if data.len() == 512 => {
                 for (word, bytes) in out.0.iter_mut().zip(data.chunks_exact(8)) {
                     *word = u64::from_le_bytes(bytes.try_into()?);
+                }
+            }
+            b'T' => {
+                let start = usize::try_from(pop_num(&mut data)?)?;
+                ensure!(
+                    start < 512 && !data.is_empty() && data.len() <= 512 - start,
+                    "posting bitmap exceeds block"
+                );
+                for (index, &byte) in (start..).zip(data) {
+                    out.0[index / 8] |= u64::from(byte) << ((index % 8) * 8);
                 }
             }
             b'L' => {
@@ -284,6 +340,15 @@ impl Block {
         for word in self.0 {
             best.extend_from_slice(&word.to_le_bytes());
         }
+        let bytes = &best[1..];
+        let first = bytes.iter().position(|byte| *byte != 0).unwrap();
+        let last = bytes.iter().rposition(|byte| *byte != 0).unwrap();
+        let mut trimmed = vec![b'T'];
+        push_num(&mut trimmed, first as u64);
+        if trimmed.len() + last - first + 1 < best.len() {
+            trimmed.extend_from_slice(&bytes[first..=last]);
+            best = trimmed;
+        }
         if count < 512 {
             let mut list = vec![b'L'];
             let mut previous = 0;
@@ -334,6 +399,11 @@ pub fn register(db: &Connection) -> Result<()> {
     db.create_scalar_function("mosh_block_slots", 1, flags, |ctx| {
         let block = sql(Block::from_bytes(ctx.get_raw(0).as_blob()?))?;
         Ok(serde_json::to_string(&block.slots().collect::<Vec<_>>()).unwrap())
+    })?;
+    db.create_scalar_function("mosh_trim_posting", 1, flags, |ctx| {
+        let value = ctx.get_raw(0).as_blob()?;
+        let block = sql(Block::from_bytes(value))?;
+        Ok(block.encode().filter(|new| new.len() < value.len()))
     })?;
     db.create_scalar_function("mosh_make_block", 1, flags, |ctx| {
         let slots: Vec<usize> = serde_json::from_str(&ctx.get::<String>(0)?)
@@ -825,6 +895,53 @@ pub fn rebuild(db: &Connection) -> Result<()> {
     writer.flush()
 }
 
+pub(crate) fn repack_dense(db: &Connection) -> Result<()> {
+    let mut query =
+        db.prepare("SELECT id,packed FROM tag_sets WHERE id>? ORDER BY id LIMIT 256")?;
+    let mut find = db.prepare("SELECT id,packed FROM tag_sets WHERE digest=?")?;
+    let mut last = 0;
+    loop {
+        let batch = query
+            .query_map([last], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if batch.is_empty() {
+            break;
+        }
+        for (id, before) in batch {
+            last = id;
+            let packed = pack_set(&unpack_set(&before)?);
+            if packed == before {
+                continue;
+            }
+            let digest = blake3::hash(&packed);
+            let matching: Option<(i64, Vec<u8>)> = find
+                .query_row([digest.as_bytes()], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()?;
+            if let Some((existing, bytes)) = matching {
+                ensure!(bytes == packed, "tag-set digest collision");
+                db.prepare_cached("UPDATE object_keys SET tag_set=? WHERE tag_set=?")?
+                    .execute(params![existing, id])?;
+                db.prepare_cached("DELETE FROM tag_sets WHERE id=?")?
+                    .execute([id])?;
+            } else {
+                db.prepare_cached("UPDATE tag_sets SET digest=?,packed=? WHERE id=?")?
+                    .execute(params![digest.as_bytes(), packed, id])?;
+            }
+        }
+    }
+    // Only changed blocks are written. Existing sparse lists and full blocks still decode.
+    db.execute_batch(
+        "WITH smaller AS MATERIALIZED (
+        SELECT tag,suggested,block,mosh_trim_posting(packed) AS bytes
+        FROM tag_blocks WHERE length(packed)>=8 AND substr(packed,1,1)<>x'54')
+        UPDATE tag_blocks AS p SET packed=s.bytes FROM smaller s
+        WHERE s.bytes IS NOT NULL AND (p.tag,p.suggested,p.block)=(s.tag,s.suggested,s.block);",
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -835,6 +952,7 @@ mod tests {
             (b'L', vec![2, 9, 128, 4095]),
             (b'R', (800..1500).collect()),
             (b'B', (0..4096).step_by(2).collect()),
+            (b'T', (117..1205).step_by(2).collect()),
             (b'A', (0..4096).collect()),
         ] {
             let mut block = Block::empty();
@@ -868,8 +986,110 @@ mod tests {
         let packed = pack_set(&gaps);
         assert_eq!(packed[0], SET_GAPS);
         assert_eq!(unpack_set(&packed)?, gaps);
+        let dense: Tags = (1..=1000)
+            .map(|id| (300 + id * 2, if id == 5 { FILESYSTEM } else { USER }))
+            .collect();
+        let packed = pack_set(&dense);
+        assert_eq!(packed[0], SET_BITMAP);
+        assert!(packed.len() < 260);
+        assert_eq!(unpack_set(&packed)?, dense);
+        assert!(unpack_set(&[SET_BITMAP, USER, 1, 2, 1]).is_err());
         assert!(unpack_set(&[USER, 128]).is_err());
         assert!(Block::from_bytes(&[b'R', 0, 0]).is_err());
+        assert!(Block::from_bytes(&[b'T', 255, 3, 1, 1]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn format_seven_dense_tags_repack_without_changing_both_posting_kinds() -> Result<()> {
+        use crate::{Mosh, SearchOptions, organization::dictionary_id};
+        use std::{fs, sync::atomic::AtomicBool};
+
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path().join("files");
+        let ledger = fixture.path().join("formats.sqlite3");
+        let files = [root.join("A.txt"), root.join("B.txt")];
+        fs::create_dir(&root)?;
+        for path in &files {
+            fs::write(path, "Dense tags")?;
+        }
+        let mosh = Mosh::open(&ledger)?;
+        mosh.scan(&root, &AtomicBool::new(false))?;
+        let tx = mosh.db.unchecked_transaction()?;
+        let mut tags = Tags::new();
+        for n in 0..500 {
+            let tag = dictionary_id(&tx, &format!("dense:{n:03}"))?;
+            if n % 2 == 0 {
+                tags.insert(tag, if n == 0 { USER | SUGGESTED } else { USER });
+            }
+        }
+        let mut keys = Vec::new();
+        let mut writer = Writer::new(&tx);
+        for path in &files {
+            let file = mosh.find(path.to_str().unwrap())?;
+            let key: i64 = tx.query_row(
+                "SELECT key FROM object_keys WHERE object=?",
+                [file.id],
+                |r| r.get(0),
+            )?;
+            let (old, before) = read_set(&tx, key)?;
+            writer.replace(key, old, &before, &tags)?;
+            keys.push(key);
+        }
+        writer.flush()?;
+
+        let mut old = vec![0];
+        let mut previous = 0;
+        for (&tag, &origin) in &tags {
+            push_num(&mut old, (tag - previous) as u64);
+            old.push(origin);
+            previous = tag;
+        }
+        tx.execute(
+            "INSERT INTO tag_sets(digest,packed,confirmed) VALUES(?,?,?)",
+            params![blake3::hash(&old).as_bytes(), old, tags.len()],
+        )?;
+        tx.execute(
+            "UPDATE object_keys SET tag_set=? WHERE key=?",
+            params![tx.last_insert_rowid(), keys[0]],
+        )?;
+        let tag = *tags.first_key_value().unwrap().0;
+        let mut bits = vec![0u8; 513];
+        bits[0] = b'B';
+        for &key in &keys {
+            bits[1 + key as usize / 8] |= 1 << (key as usize % 8);
+        }
+        tx.execute(
+            "UPDATE tag_blocks SET packed=? WHERE tag=?",
+            params![bits, tag],
+        )?;
+        tx.pragma_update(None, "user_version", 7)?;
+        tx.commit()?;
+        drop(mosh);
+
+        let mosh = Mosh::open(&ledger)?;
+        let (first, stored) = read_set(&mosh.db, keys[0])?;
+        assert_eq!(stored, tags);
+        assert_eq!(read_set(&mosh.db, keys[1])?, (first, tags));
+        let old_rows: i64 = mosh.db.query_row(
+            "SELECT count(*) FROM tag_blocks WHERE tag=? AND length(packed)=513",
+            [tag],
+            |r| r.get(0),
+        )?;
+        assert_eq!(old_rows, 0);
+        let kinds: i64 =
+            mosh.db
+                .query_row("SELECT count(*) FROM tag_blocks WHERE tag=?", [tag], |r| {
+                    r.get(0)
+                })?;
+        assert_eq!(kinds, 2);
+        mosh.rebuild()?;
+        mosh.compact()?;
+        assert_eq!(
+            mosh.search("direct-tag:dense:000", &SearchOptions::default())?
+                .len(),
+            2
+        );
         Ok(())
     }
 }
