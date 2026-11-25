@@ -1001,7 +1001,7 @@ mod tests {
     }
 
     #[test]
-    fn format_seven_dense_tags_repack_without_changing_both_posting_kinds() -> Result<()> {
+    fn legacy_dense_tags_repack_without_changing_both_posting_kinds() -> Result<()> {
         use crate::{Mosh, SearchOptions, organization::dictionary_id};
         use std::{fs, sync::atomic::AtomicBool};
 
@@ -1063,11 +1063,8 @@ mod tests {
             "UPDATE tag_blocks SET packed=? WHERE tag=?",
             params![bits, tag],
         )?;
-        tx.pragma_update(None, "user_version", 7)?;
+        repack_dense(&tx)?;
         tx.commit()?;
-        drop(mosh);
-
-        let mosh = Mosh::open(&ledger)?;
         let (first, stored) = read_set(&mosh.db, keys[0])?;
         assert_eq!(stored, tags);
         assert_eq!(read_set(&mosh.db, keys[1])?, (first, tags));

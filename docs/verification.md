@@ -82,7 +82,16 @@ Run `cargo test --locked --release storage_churn_workload -- --ignored --nocaptu
 
 These are small generated workloads. The kernel benchmark remains available for source-tree comparison.
 
-A separate fixed-cost measurement scanned 10,000 generated 4,096-byte C files, arranged in 200 components with 50 files per component and a shared `subsystem` directory within each component. With filesystem tags, compaction left 6,193,152 Ledger bytes for 40,960,000 source bytes, or **619 bytes per file** and **15.1%** of source size. The scan took 12.76 s. File rows and key maps used 292 bytes per file. Their absolute path text alone accounted for 141 raw bytes per file. Directory-key path reconstruction remains a measurable opportunity. The preview retains full paths for indexed path filters and native operations.
+A separate fixed-cost measurement of format 8 scanned 10,000 generated 4,096-byte C files, arranged in 200 components with 50 files per component and a shared `subsystem` directory within each component. With filesystem tags, compaction left 6,193,152 Ledger bytes for 40,960,000 source bytes, or **619 bytes per file** and **15.1%** of source size. The scan took 12.76 s. File rows and key maps used 292 bytes per file. Their absolute path text alone accounted for 141 raw bytes per file.
+
+## Format 9 file storage
+
+The published format 8 CLI and a format 9 release build indexed the same 10,000 generated C files on Windows. Each of 100 components contained a `subsystem` folder with 100 files, each 4,096 bytes. The runs used filesystem tags, with optional inference and the source-text cache disabled.
+
+- The compacted Ledger fell from **5,660,672 to 4,112,384 bytes**, or **566.07 to 411.24 bytes per file**, a **27.4%** reduction. Both empty Ledgers used 372,736 bytes. The format 9 import itself added **373.96 bytes per file** after subtracting the empty Ledger. The shared directory dictionary occupied 32,768 bytes in the populated Ledger.
+- One representative file row fell from **212 to 85 bytes**, including SQLite record and cell framing. The old row held a 115-byte absolute path. The new row used one byte for its directory key and twelve for its basename. The sample's other value bytes were 4 for the file ID, 4 for the logical parent, 16 for the native ID, 18 for the three timestamps, and 2 for size. Record and cell framing used 28 bytes.
+- Inserting one more file into an already indexed directory used **543 bytes** within existing pages, compared with **696 bytes** in format 8. Format 9 used 83 for the file row, 38 for the key map and its two indexes, 82 for the four lookup entries, 31 for tiers, 9 for the shared tag-set entry, 14 for the metadata search document record, and 286 for changes to shared full-text postings and segment metadata. Shared posting growth varies with the new terms and current segments.
+- A copied format 8 Ledger retained a selected file's ID, user tag, Paint, and live accented-content search after migration. The rebuilt Ledger recognized the same ID and Paint after its parent directory was moved. Extension, size, modification, name, and path filters returned the same result IDs on both formats. Mean query times, including CLI startup, ranged from 49 to 51 ms in format 8 and 43 to 48 ms in format 9 in the final run. The unchanged rescan took 2.56 s in format 8 and 3.10 s in format 9.
 
 ## Preview retrieval evaluation
 

@@ -306,6 +306,11 @@ fn storage_churn_workload() -> Result<()> {
             let compact_lookup = index_read(true)?;
             let mut legacy = Value::Null;
             if mode == 0 {
+                let path_update: String = mosh.db.query_row(
+                    "SELECT sql FROM sqlite_schema WHERE name='unique_live_path_update'",
+                    [],
+                    |row| row.get(0),
+                )?;
                 mosh.db.execute_batch("DROP TRIGGER unique_live_path_insert; DROP TRIGGER unique_live_path_update;
                     DROP INDEX live_path_key; CREATE UNIQUE INDEX live_path ON objects(path) WHERE missing=0 AND path IS NOT NULL;
                     DROP INDEX object_git; CREATE INDEX object_git ON objects(git_root,git_status);
@@ -316,6 +321,9 @@ fn storage_churn_workload() -> Result<()> {
                 mosh.compact()?;
                 legacy = json!({"storage":mosh.storage_usage()?,"exact_path_mean_ms":index_read(false)?});
                 mosh.db.execute_batch(include_str!("ledger_v6.sql"))?;
+                mosh.db
+                    .execute_batch("DROP TRIGGER unique_live_path_update;")?;
+                mosh.db.execute_batch(&path_update)?;
             }
             let vocabulary = (0..2048)
                 .map(|n| crate::organization::dictionary_id(&mosh.db, &format!("load:{n:04}")))

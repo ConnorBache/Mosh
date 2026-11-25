@@ -21,6 +21,7 @@ fn page_group(name: &str) -> &'static str {
         "audit" | "object_audit" | "tag_audit_members" => "audit_history",
         "tag_history" | "tag_history_tag" | "tag_history_object" => "vocabulary_history",
         "file_tiers" | "file_tier_rank" | "tiers" => "tier_records",
+        "path_folders" | "sqlite_autoindex_path_folders_1" => "path_directory_dictionary",
         "live_path" | "live_path_key" | "object_path" => "file_indexes",
         "text_cached" => "source_text_cache",
         "paint" => "paint",
@@ -429,8 +430,11 @@ impl Mosh {
 
     pub fn compact(&self) -> Result<()> {
         self.admin()?;
-        self.db
-            .execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")?;
+        self.db.execute_batch(
+            "DELETE FROM path_folders WHERE id NOT IN
+                (SELECT path_folder FROM objects WHERE path_folder IS NOT NULL);
+             VACUUM; PRAGMA wal_checkpoint(TRUNCATE);",
+        )?;
         Ok(())
     }
 

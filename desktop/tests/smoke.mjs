@@ -67,7 +67,7 @@ try {
   await page.locator('.sidebar').getByRole('button', { name: 'Sample workspace', exact: true }).click()
   await page.getByRole('heading', { name: 'Sample workspace' }).waitFor()
   if (legacy) {
-    assert.equal(version(db), 8)
+    assert.equal(version(db), 9)
     assert.equal(version(oldDb), 1)
   }
   await page.getByRole('button', { name: 'Orbit.md', exact: true }).click()

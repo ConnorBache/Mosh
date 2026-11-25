@@ -219,14 +219,7 @@ fn index_one(
     let name = path.file_name().and_then(|s| s.to_str()).unwrap_or(key);
     let is_reparse = fsmeta::reparse(&meta);
     let kind = if meta.is_dir() { "coll" } else { "file" };
-    let extension = if kind == "file" {
-        path.extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_lowercase()
-    } else {
-        String::new()
-    };
+    let extension = crate::lean::file_extension(name, kind == "file");
     let parent = path
         .parent()
         .and_then(Path::to_str)
@@ -264,12 +257,13 @@ fn index_one(
         .then(|| fs::read_link(path).ok())
         .flatten()
         .and_then(|p| p.to_str().map(str::to_owned));
-    db.prepare_cached("INSERT INTO objects(id,kind,path,parent,name,extension,size,created,modified,changed,native_id,reparse,link_target)
+    let (folder, literal) = crate::lean::store_location(db, key, name, kind == "file")?;
+    db.prepare_cached("INSERT INTO objects(id,kind_code,path_literal,parent,name,path_folder,size,created,modified,changed,native_id,reparse,link_target)
         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
-        ON CONFLICT(id) DO UPDATE SET path=?3,parent=?4,name=?5,extension=?6,size=?7,created=?8,modified=?9,
+        ON CONFLICT(id) DO UPDATE SET path_literal=?3,parent=?4,name=?5,path_folder=?6,size=?7,created=?8,modified=?9,
         changed=?10,native_id=coalesce(?11,native_id),reparse=?12,link_target=?13,revision=revision+?14,missing=0,
         hash=CASE WHEN ?14=1 THEN NULL ELSE hash END")?
-        .execute(params![id,kind,key,parent,name,extension,size,created,modified,native.changed,
+        .execute(params![id,i64::from(meta.is_dir()),literal,parent,name,folder,size,created,modified,native.changed,
             native.id.as_deref().map(fsmeta::pack_id),is_reparse,link_target,changed])?;
     if full_scan {
         db.prepare_cached("INSERT OR IGNORE INTO scan_present VALUES(?)")?

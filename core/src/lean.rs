@@ -133,8 +133,69 @@ pub(crate) fn resolve(db: &Connection, reference: &str) -> Result<Option<String>
         .optional()?)
 }
 
+fn parent_prefix<'a>(path: &'a str, name: &str) -> Option<&'a str> {
+    if name.is_empty() {
+        return None;
+    }
+    path.strip_suffix(name)
+        .filter(|prefix| prefix.ends_with(std::path::MAIN_SEPARATOR))
+}
+
+pub(crate) fn store_location<'a>(
+    db: &Connection,
+    path: &'a str,
+    basename: &str,
+    file: bool,
+) -> Result<(Option<i64>, Option<&'a str>)> {
+    let Some(prefix) = parent_prefix(path, basename).filter(|_| file) else {
+        return Ok((None, Some(path)));
+    };
+    let mut lookup = db.prepare_cached("SELECT id FROM path_folders WHERE prefix=?")?;
+    if let Some(id) = lookup.query_row([prefix], |row| row.get(0)).optional()? {
+        return Ok((Some(id), None));
+    }
+    let id = db
+        .prepare_cached("INSERT INTO path_folders(prefix) VALUES(?) RETURNING id")?
+        .query_row([prefix], |row| row.get(0))?;
+    Ok((Some(id), None))
+}
+
 pub(crate) fn register(db: &Connection) -> Result<()> {
     let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC;
+    let generated = flags | FunctionFlags::SQLITE_INNOCUOUS;
+    db.create_scalar_function("mosh_path_prefix", 2, generated, |ctx| {
+        let path: Option<String> = ctx.get(0)?;
+        let name: Option<String> = ctx.get(1)?;
+        Ok(path
+            .as_deref()
+            .zip(name.as_deref())
+            .and_then(|(p, name)| parent_prefix(p, name))
+            .map(str::to_owned))
+    })?;
+    db.create_scalar_function("mosh_expand_path", 3, generated, |ctx| {
+        let folder: Option<i64> = ctx.get(0)?;
+        let name: Option<String> = ctx.get(1)?;
+        let Some((folder, name)) = folder.zip(name) else {
+            return ctx.get::<Option<String>>(2);
+        };
+        // The reference stays in this synchronous callback. Read the immutable
+        // dictionary on this connection so it participates in the caller's snapshot.
+        let db = unsafe { ctx.get_connection()? };
+        let mut prefix: String = db.query_row(
+            "SELECT prefix FROM main.path_folders WHERE id=?",
+            [folder],
+            |row| row.get(0),
+        )?;
+        prefix.push_str(&name);
+        Ok(Some(prefix))
+    })?;
+    db.create_scalar_function("mosh_file_extension", 2, generated, |ctx| {
+        let name: Option<String> = ctx.get(0)?;
+        let kind: Option<i64> = ctx.get(1)?;
+        Ok(name
+            .zip(kind)
+            .map(|(name, kind)| file_extension(&name, kind == 0)))
+    })?;
     db.create_scalar_function(
         "mosh_path_key",
         1,
@@ -156,6 +217,17 @@ pub(crate) fn register(db: &Connection) -> Result<()> {
             .map_or(Value::Null, |id| crate::fsmeta::pack_id(&id)))
     })?;
     Ok(())
+}
+
+pub(crate) fn file_extension(name: &str, file: bool) -> String {
+    if !file {
+        return String::new();
+    }
+    Path::new(name)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_lowercase()
 }
 
 pub(crate) fn migrate(db: &Connection) -> Result<()> {
@@ -250,8 +322,21 @@ mod upgrade_tests {
         let mosh = Mosh::open(&db_path)?;
         let key = mosh.get("v2-file")?.id;
         let check = |mosh: &Mosh| -> Result<()> {
+            let (literal, prefix, extension): (Option<String>, String, String) =
+                mosh.db.query_row(
+                    "SELECT o.path_literal,f.prefix,o.extension FROM objects o
+                 JOIN path_folders f ON f.id=o.path_folder WHERE o.id=?",
+                    [&key],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )?;
+            assert!(literal.is_none());
+            assert_eq!(
+                format!("{prefix}source.txt"),
+                crate::path_text(&crate::canonical(&file)?)?
+            );
+            assert_eq!(extension, "txt");
             let hits = mosh.search(
-                "content:resume direct-tag:workstream paint:handoff marriage:References",
+                "content:resume ext:txt direct-tag:workstream paint:handoff marriage:References",
                 &SearchOptions::default(),
             )?;
             assert_eq!(hits.len(), 1);

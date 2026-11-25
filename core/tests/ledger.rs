@@ -72,6 +72,10 @@ fn search_inheritance_paint_and_identity_survive_rename() -> Result<()> {
     );
     assert_eq!(fixture.search("paint:mechanics")?, ["résumé.rs"]);
     assert_eq!(fixture.search("ext:rs NOT tag:obsolete")?, ["résumé.rs"]);
+    assert_eq!(fixture.search("kind:file path:projet")?, ["résumé.rs"]);
+    assert_eq!(fixture.search("kind:file path:résumé")?, ["résumé.rs"]);
+    let across = format!("kind:file path:été{}résumé.rs", std::path::MAIN_SEPARATOR);
+    assert_eq!(fixture.search(&across)?, ["résumé.rs"]);
     assert!(
         fixture
             .search("content:submarine AND (ext:txt OR ext:md)")?
@@ -578,7 +582,7 @@ fn records_authentic_windows_file_metadata() -> Result<()> {
     let raw = rusqlite::Connection::open(&fixture.db)?;
     let stored: (String, i64, bool) = raw.query_row(
         "SELECT typeof(native_id), length(native_id),
-            allocated IS NULL AND volume IS NULL AND attributes IS NULL AND mime IS NULL
+            path_folder IS NOT NULL AND path_literal IS NULL AND mime IS NULL
             FROM objects WHERE id=?",
         [&object.id],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -586,6 +590,12 @@ fn records_authentic_windows_file_metadata() -> Result<()> {
     assert_eq!(stored.0, "blob");
     assert!(matches!(stored.1, 16 | 24));
     assert!(stored.2);
+    let stored_live_fields: i64 = raw.query_row(
+        "SELECT count(*) FROM pragma_table_xinfo('objects') WHERE hidden=0
+         AND name IN ('path','extension','allocated','accessed','attributes','volume','filesystem','hardlinks')",
+        [], |row| row.get(0),
+    )?;
+    assert_eq!(stored_live_fields, 0);
     assert!(fixture.mosh.history(Some(&object.id), 20)?.is_empty());
     Ok(())
 }

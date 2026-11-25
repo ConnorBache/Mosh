@@ -558,7 +558,7 @@ impl Mosh {
         if plan.action == Action::Marriage {
             let id = crate::lean::next_id(&tx)?;
             tx.execute(
-                "INSERT INTO objects(id,kind,name) VALUES(?,'marriage',?)",
+                "INSERT INTO objects(id,kind_code,name) VALUES(?,2,?)",
                 params![id, plan.argument],
             )?;
             tx.execute("INSERT INTO owners VALUES(?,?)", params![id, self.actor])?;
@@ -720,7 +720,7 @@ impl Mosh {
         // stronger evidence than the birth-time check used for an external rename.
         ensure!(
             self.db.execute(
-                "UPDATE objects SET path=?,created=?,missing=0 WHERE id=?",
+                "UPDATE objects SET path_literal=?,path_folder=NULL,created=?,missing=0 WHERE id=?",
                 params![path_text(path)?, created, entry.object]
             )? == 1,
             "could not reconnect the file to its Ledger identity"

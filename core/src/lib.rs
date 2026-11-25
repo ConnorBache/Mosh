@@ -38,7 +38,7 @@ pub struct Mosh {
     actor: String,
 }
 
-const LEDGER_VERSION: i64 = 8;
+const LEDGER_VERSION: i64 = 9;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Object {
@@ -83,16 +83,16 @@ fn object(row: &Row<'_>) -> rusqlite::Result<Object> {
         extension,
         mime,
         size: row.get("size")?,
-        allocated: row.get("allocated")?,
+        allocated: None,
         created: row.get("created")?,
         modified: row.get("modified")?,
-        accessed: row.get("accessed")?,
+        accessed: None,
         changed: row.get("changed")?,
-        attributes: row.get("attributes")?,
+        attributes: None,
         native_id: fsmeta::unpack_id(row.get_ref("native_id")?)?,
-        volume: row.get("volume")?,
-        filesystem: row.get("filesystem")?,
-        hardlinks: row.get("hardlinks")?,
+        volume: None,
+        filesystem: None,
+        hardlinks: None,
         reparse: row.get("reparse")?,
         link_target: row.get("link_target")?,
         hash: row.get("hash")?,
@@ -217,6 +217,9 @@ impl Mosh {
             }
             if (2..8).contains(&locked_version) {
                 packed_tags::repack_dense(&tx)?;
+            }
+            if locked_version < 9 {
+                tx.execute_batch(include_str!("ledger_v9.sql"))?;
             }
             tx.pragma_update(None, "user_version", LEDGER_VERSION)?;
             tx.commit()?;

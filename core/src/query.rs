@@ -279,10 +279,17 @@ impl Parser {
                 "instr(lower(o.name),lower({}))>0",
                 self.bind(value.to_owned())
             ),
-            "path" => format!(
-                "instr(lower(o.path),lower({}))>0",
-                self.bind(value.to_owned())
-            ),
+            "path" => {
+                let needle = self.bind(value.to_owned());
+                if value.contains(std::path::MAIN_SEPARATOR) {
+                    format!("instr(lower(o.path),lower({needle}))>0")
+                } else {
+                    // A match without the separator cannot cross from a prefix into a basename.
+                    format!("(instr(lower(o.path_literal),lower({needle}))>0 OR
+                        (o.path_folder IS NOT NULL AND (instr(lower(o.name),lower({needle}))>0 OR
+                        o.path_folder IN(SELECT id FROM path_folders WHERE instr(lower(prefix),lower({needle}))>0))))")
+                }
+            }
             "ext" | "extension" => format!(
                 "o.extension={}",
                 self.bind(value.trim_start_matches('.').to_lowercase())
@@ -597,9 +604,12 @@ impl Mosh {
         }
         let limit = parser.bind(options.limit.clamp(1, 2000) as i64);
         let offset = parser.bind(options.offset.min(i64::MAX as usize) as i64);
+        // Filter and sort keys before decoding the complete file objects on this page.
         let sql = format!(
-            "{AUTHORITY} SELECT o.* FROM objects o WHERE o.missing=0 AND {VISIBLE}
-            AND ({predicate}) {scope} ORDER BY {order} LIMIT {limit} OFFSET {offset}"
+            "{AUTHORITY}, selected(id) AS MATERIALIZED (
+                SELECT o.id FROM objects o WHERE o.missing=0 AND {VISIBLE}
+                AND ({predicate}) {scope} ORDER BY {order} LIMIT {limit} OFFSET {offset}
+             ) SELECT o.* FROM selected s JOIN objects o ON o.id=s.id ORDER BY {order}"
         );
         let mut statement = self.db.prepare(&sql)?;
         let results = statement.query_map(params_from_iter(parser.values), object)?;
