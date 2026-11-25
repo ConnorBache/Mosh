@@ -43,7 +43,7 @@ try {
   const page = context.pages()[0] ?? await context.waitForEvent('page')
   page.setDefaultTimeout(8000)
   const nav = (name) => page.getByRole('navigation', { name: 'Workspace' }).getByRole('button', { name, exact: true })
-  await page.getByRole('button', { name: 'Sample workspace', exact: true }).click()
+  await page.locator('.sidebar').getByRole('button', { name: 'Sample workspace', exact: true }).click()
   await page.getByRole('heading', { name: 'Sample workspace' }).waitFor()
   await page.getByRole('button', { name: 'Orbit.md', exact: true }).click()
   const inspector = page.getByRole('complementary', { name: 'Metadata inspector' })
@@ -112,5 +112,5 @@ try {
     app.kill()
     await exited
   }
-  await rm(fixture, { recursive: true, force: true, maxRetries: 5, retryDelay: 250 })
+  await rm(fixture, { recursive: true, force: true, maxRetries: 20, retryDelay: 250 })
 }
