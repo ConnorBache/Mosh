@@ -14,7 +14,7 @@ The initial build is the stopping point for the product clarification.
 - [x] Exercise Ledger integrity, rebuild, and backup restoration.
 - [x] Smoke-test the versioned read API with a restricted actor.
 - [x] Verify the 10,000-file fixture and record measured results.
-- [ ] Smoke-test the packaged Windows desktop and publish the installer and CLI.
+- [x] Smoke-test the packaged Windows desktop and publish the installer and CLI.
 
 ## Deferred from the full brief
 

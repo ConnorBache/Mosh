@@ -4,7 +4,13 @@ Mosh uses generated test directories and a dedicated temporary database. The rep
 
 Run `cargo test --locked` to execute the Windows core integration suite. It exercises native file metadata, rename and identity tracking, text search, contextual tags, virtual references, permissions, Git, real Windows directory watching, exact duplicates, hardlinks, backup and restore, and confirmation and undo for physical plans.
 
-The [Windows build workflow](https://github.com/ConnorBache/Mosh/actions/workflows/windows.yml) builds the installer and CLI and exercises the installed WebView2 interface. The smoke test covers directory browsing, metadata inspection, Paint search, Tag Explorer, Marriage references, duplicate analysis, Cleave preview and undo, and History.
+All seven integration tests passed on Windows x64. The optimized CLI also passed a separate 42-file smoke run with the restricted loopback API, duplicate verification, quarantine, undo, and integrity checking.
+
+The v0.1.0 NSIS installer passed a clean local installation and an automated WebView2 smoke test. The test covered directory browsing, metadata inspection, Paint search, Tag Explorer, Marriage references, duplicate analysis, Cleave preview and undo, and History. It used a generated directory and a disposable Ledger, then removed the test installation.
+
+The [Windows build workflow](https://github.com/ConnorBache/Mosh/actions/workflows/windows.yml) builds the installer and CLI. Hosted runner attempts could install the app, but the test harness could not attach to their WebView2 process. The workflow offers the desktop smoke test as an opt-in step for diagnosing that environment. The release uses the installer that passed the local clean-install test.
+
+To repeat the desktop smoke test in an interactive Windows session, install Mosh into a fresh directory, run `npm ci` in `desktop`, and run `node desktop/tests/smoke.mjs <installed-mosh-desktop.exe> <mosh.exe>` from the repository root.
 
 ## Initial Windows benchmark
 

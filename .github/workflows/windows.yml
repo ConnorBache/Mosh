@@ -4,6 +4,11 @@ on:
   push:
     paths: ['Cargo.*', 'core/**', 'cli/**', 'desktop/**', '.github/workflows/windows.yml']
   workflow_dispatch:
+    inputs:
+      desktop_smoke:
+        description: Exercise the installed app through WebView2 debugging
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -49,6 +54,7 @@ jobs:
           path: release/
           if-no-files-found: error
       - name: Install on a clean runner and exercise the real desktop
+        if: github.event_name == 'workflow_dispatch' && inputs.desktop_smoke
         shell: pwsh
         run: |
           $installer = Get-ChildItem release/*-setup.exe | Select-Object -First 1

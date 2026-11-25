@@ -95,7 +95,7 @@ try {
 
   await nav('Cleave').click()
   await page.getByRole('textbox', { name: 'Ledger query' }).fill('name:Orbit.md')
-  await page.getByLabel('Action', { exact: true }).selectOption('quarantine')
+  await page.getByRole('combobox').selectOption('quarantine')
   await page.getByRole('button', { name: 'Preview', exact: true }).click()
   await page.getByRole('heading', { name: 'Manifest' }).waitFor()
   const execute = page.getByRole('button', { name: 'Execute plan' })
