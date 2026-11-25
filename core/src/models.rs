@@ -597,7 +597,7 @@ impl Mosh {
         {
             tx.execute("INSERT INTO ai_jobs(kind,object_key,revision,priority,queued)
                 SELECT 'enrich',k.key,o.revision,coalesce(f.target*10+f.predicted_hotness,10),?
-                FROM objects o JOIN object_keys k ON k.object=o.id LEFT JOIN file_tiers f ON f.object_key=k.key
+                FROM objects o JOIN object_keys k ON k.key=o.key LEFT JOIN file_tiers f ON f.object_key=k.key
                 WHERE o.missing=0 AND o.reparse=0
                 ON CONFLICT(kind,object_key,revision,scope) DO UPDATE SET state='queued',ready=0,attempts=0,error=NULL
                 WHERE ai_jobs.state IN ('done','failed','obsolete')",[now()])?;

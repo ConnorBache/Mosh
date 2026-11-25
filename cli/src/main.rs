@@ -304,15 +304,8 @@ enum TagCommand {
 #[derive(Subcommand)]
 enum LedgerCommand {
     Rebuild,
-    /// Reclaim unused database pages after upgrading or clearing the content cache.
+    /// Reclaim unused pages after upgrading or deleting Ledger data.
     Compact,
-    /// Report the content cache's page usage and configured budget.
-    TextStatus,
-    /// Build an optional content index within a byte budget. Zero clears it.
-    TextIndex {
-        #[arg(long)]
-        max_bytes: i64,
-    },
 }
 
 fn collection(mosh: &Mosh, action: CollectionCommand, marriage: bool) -> Result<Value> {
@@ -557,15 +550,7 @@ fn run(cli: Cli) -> Result<Option<Value>> {
                 mosh.compact()?;
                 mosh.doctor()?
             }
-            Command::Ledger {
-                action: LedgerCommand::TextStatus,
-            } => mosh.text_status()?,
-            Command::Ledger {
-                action: LedgerCommand::TextIndex { max_bytes },
-            } => {
-                let cancel = on_interrupt()?;
-                mosh.index_text(max_bytes, &cancel)?
-            }
+
             Command::Doctor => mosh.doctor()?,
             Command::Ask { request, answer } => mosh.ask(&request, answer)?,
             Command::Individuality { reference } => mosh.individuality(&reference)?,

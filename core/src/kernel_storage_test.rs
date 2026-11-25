@@ -22,7 +22,7 @@ fn measure_densities(mosh: &Mosh, files: i64, source_bytes: i64) -> Result<()> {
         let mut last = 0;
         loop {
             let tx = Transaction::new_unchecked(&mosh.db, TransactionBehavior::Immediate)?;
-            let batch = tx.prepare_cached("SELECT k.key FROM object_keys k JOIN objects o ON o.id=k.object
+            let batch = tx.prepare_cached("SELECT k.key FROM object_keys k JOIN objects o ON o.key=k.key
                 WHERE o.missing=0 AND o.kind='file' AND o.reparse=0 AND k.key>? ORDER BY k.key LIMIT 4096")?
                 .query_map([last], |r| r.get::<_, i64>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -84,7 +84,7 @@ fn measure_densities(mosh: &Mosh, files: i64, source_bytes: i64) -> Result<()> {
 
 fn source_size(mosh: &Mosh) -> Result<(i64, i64)> {
     Ok(mosh.db.query_row(
-        "SELECT count(*),sum(size) FROM objects WHERE missing=0 AND kind='file' AND reparse=0",
+        "SELECT count(*),sum(mosh_live_stat(path,native_id,created,reparse,'size')) FROM objects WHERE missing=0 AND kind='file' AND reparse=0",
         [],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?)
@@ -314,13 +314,15 @@ fn storage_churn_workload() -> Result<()> {
                 mosh.db.execute_batch("DROP TRIGGER unique_live_path_insert; DROP TRIGGER unique_live_path_update;
                     DROP INDEX live_path_key; CREATE UNIQUE INDEX live_path ON objects(path) WHERE missing=0 AND path IS NOT NULL;
                     DROP INDEX object_git; CREATE INDEX object_git ON objects(git_root,git_status);
-                    DROP INDEX object_parent;
-                    CREATE INDEX object_parent ON objects(parent,missing,name COLLATE NOCASE,id);
+                    DROP INDEX object_parent_key;
+                    CREATE INDEX object_parent ON objects(parent_key,missing,name COLLATE NOCASE);
                     UPDATE file_tiers SET assessor='filesystem' WHERE assessor='f';")?;
                 mosh.compact()?;
                 legacy = json!({"storage":mosh.storage_usage()?,"exact_path_mean_ms":index_read(false)?});
                 mosh.db.execute_batch(
-                    &include_str!("ledger_v6.sql").replace("DROP INDEX file_tier_rank;", ""),
+                    &include_str!("ledger_v6.sql").replace("DROP INDEX file_tier_rank;", "")
+                        .replace("CREATE INDEX object_parent ON objects(parent,missing,name COLLATE NOCASE);",
+                                 "CREATE INDEX object_parent_key ON objects(parent_key) WHERE missing=0;"),
                 )?;
                 mosh.db
                     .execute_batch("DROP TRIGGER unique_live_path_update;")?;
@@ -332,7 +334,7 @@ fn storage_churn_workload() -> Result<()> {
             let fill = |density: usize| -> Result<Value> {
                 let time = Instant::now();
                 let tx = Transaction::new_unchecked(&mosh.db, TransactionBehavior::Immediate)?;
-                let mut statement=tx.prepare("SELECT k.key FROM object_keys k JOIN objects o ON o.id=k.object WHERE o.kind='file' AND o.missing=0 ORDER BY k.key")?;
+                let mut statement=tx.prepare("SELECT k.key FROM object_keys k JOIN objects o ON o.key=k.key WHERE o.kind='file' AND o.missing=0 ORDER BY k.key")?;
                 let keys = statement
                     .query_map([], |r| r.get::<_, i64>(0))?
                     .collect::<rusqlite::Result<Vec<_>>>()?;

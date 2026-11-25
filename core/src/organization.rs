@@ -11,11 +11,11 @@ pub(crate) const VISIBLE: &str = "((NOT EXISTS(SELECT 1 FROM nested_moshes) OR
     NOT EXISTS(SELECT 1 FROM nested_moshes boundary
         WHERE o.path IS NOT NULL AND mosh_within_path(o.path,boundary.root))) AND (?1='local' OR NOT EXISTS(
     SELECT 1 FROM objects s WHERE s.secret=1 AND s.missing=0
-    AND (s.id=o.id OR (s.path IS NOT NULL AND o.path IS NOT NULL AND
+    AND (s.key=o.key OR (s.path IS NOT NULL AND o.path IS NOT NULL AND
         substr(o.path,1,length(rtrim(s.path,?2))+1)=rtrim(s.path,?2)||?2))
-    AND NOT EXISTS(SELECT 1 FROM owners w JOIN authority a ON a.person=w.person WHERE w.object=s.id)
-    AND NOT EXISTS(SELECT 1 FROM guests g WHERE g.object=s.id AND g.person=?1)
-    AND NOT EXISTS(SELECT 1 FROM guest_rights g WHERE g.object=s.id AND g.person=?1 AND g.right='discover')
+    AND NOT EXISTS(SELECT 1 FROM owners w JOIN authority a ON a.person=w.person WHERE w.object=s.key)
+    AND NOT EXISTS(SELECT 1 FROM guests g WHERE g.object=s.key AND g.person=?1)
+    AND NOT EXISTS(SELECT 1 FROM guest_rights g WHERE g.object=s.key AND g.person=?1 AND g.right='discover')
 )))";
 
 pub(crate) fn tag_name(name: &str) -> Result<String> {
@@ -53,10 +53,10 @@ pub(crate) fn dictionary_id(db: &Connection, name: &str) -> Result<i64> {
 
 impl Mosh {
     pub(crate) fn can_read(&self, selected: &Object) -> Result<bool> {
-        let sql = format!("{AUTHORITY} SELECT {VISIBLE} FROM objects o WHERE id=?3");
+        let sql = format!("{AUTHORITY} SELECT {VISIBLE} FROM objects o WHERE key=?3");
         Ok(self.db.query_row(
             &sql,
-            params![self.actor, std::path::MAIN_SEPARATOR_STR, selected.id],
+            params![self.actor, std::path::MAIN_SEPARATOR_STR, selected.key],
             |row| row.get(0),
         )?)
     }
@@ -66,7 +66,7 @@ impl Mosh {
             return Ok(true);
         }
         let sql = format!(
-            "{AUTHORITY} SELECT EXISTS(SELECT 1 FROM owners w JOIN authority a ON a.person=w.person WHERE w.object=?2)"
+            "{AUTHORITY} SELECT EXISTS(SELECT 1 FROM owners w JOIN authority a ON a.person=w.person WHERE w.object=mosh_key(?2))"
         );
         Ok(self
             .db
@@ -77,7 +77,7 @@ impl Mosh {
         ensure!(self.permits(item, "edit")?, "edit permission required");
         let guest: bool = self.db.query_row(
             "SELECT EXISTS(SELECT 1 FROM guests WHERE object=? AND person=? AND permission='edit')",
-            params![item.id, self.actor],
+            params![item.key, self.actor],
             |r| r.get(0),
         )?;
         if self.owns(&item.id)? || guest || self.explicit_right(item, "edit")? {
@@ -120,22 +120,22 @@ impl Mosh {
             "owner" => {
                 transaction.execute(
                     "INSERT OR IGNORE INTO owners VALUES(?,?)",
-                    params![item.id, person],
+                    params![item.key, person],
                 )?;
             }
             "read" | "edit" => {
                 transaction.execute("INSERT INTO guests VALUES(?,?,?) ON CONFLICT DO UPDATE SET permission=excluded.permission",
-                params![item.id,person,permission])?;
+                params![item.key,person,permission])?;
             }
             "revoke" => {
                 transaction.execute(
                     "DELETE FROM guests WHERE object=? AND person=?",
-                    params![item.id, person],
+                    params![item.key, person],
                 )?;
                 transaction.execute(
                     "DELETE FROM owners WHERE object=?1 AND person=?2
                     AND EXISTS(SELECT 1 FROM owners WHERE object=?1 AND person<>?2)",
-                    params![item.id, person],
+                    params![item.key, person],
                 )?;
             }
             _ => anyhow::bail!("permission must be owner, read, edit, or revoke"),
@@ -160,8 +160,8 @@ impl Mosh {
             "Coll owner authority required"
         );
         self.db.execute(
-            "UPDATE objects SET secret=? WHERE id=?",
-            params![enabled, item.id],
+            "UPDATE objects SET secret=? WHERE key=?",
+            params![enabled, item.key],
         )?;
         Ok(())
     }
@@ -173,19 +173,19 @@ impl Mosh {
         }
         let readable = crate::security::allowed("paint");
         let sql = format!("{AUTHORITY}, ancestors(id,depth) AS (
-            SELECT ?3,0 UNION ALL SELECT o.parent,depth+1 FROM ancestors a JOIN objects o ON o.id=a.id WHERE o.parent IS NOT NULL
+            SELECT ?3,0 UNION ALL SELECT o.parent_key,depth+1 FROM ancestors a JOIN objects o ON o.key=a.id WHERE o.parent_key IS NOT NULL
         ), origins(bit,name) AS (VALUES(1,'user'),(2,'automatic'),(4,'filesystem'),(8,'git'),(16,'suggested'),(32,'ai'),(64,'contextual'))
         SELECT t.name,g.name,coalesce(d.confidence,1),CASE WHEN d.origin IS NOT NULL THEN d.evidence
             WHEN g.bit=4 THEN 'file metadata' ELSE NULL END,o.id,ancestors.depth
-        FROM ancestors JOIN objects o ON o.id=ancestors.id JOIN object_keys k ON k.object=o.id
-        JOIN tag_sets s ON s.id=k.tag_set JOIN json_each(mosh_set_tags(s.packed)) a
+        FROM ancestors JOIN objects o ON o.key=ancestors.id
+        JOIN tag_sets s ON s.id=o.tag_set JOIN json_each(mosh_set_tags(s.packed)) a
         JOIN origins g ON (a.value->>1) & g.bit <> 0 JOIN tag_dictionary t ON t.id=(a.value->>0)
-        LEFT JOIN tag_details d ON d.object_key=k.key AND d.tag=t.id AND d.origin=g.bit
+        LEFT JOIN tag_details d ON d.object_key=o.key AND d.tag=t.id AND d.origin=g.bit
         WHERE (ancestors.depth=0 OR g.bit<>16) AND {VISIBLE} AND {readable}
         ORDER BY ancestors.depth,t.name,g.name");
         let mut query = self.db.prepare(&sql)?;
         let rows = query.query_map(
-            params![self.actor, std::path::MAIN_SEPARATOR_STR, selected.id],
+            params![self.actor, std::path::MAIN_SEPARATOR_STR, selected.key],
             |r| {
                 Ok(
                     json!({"name":r.get::<_,String>(0)?,"origin":r.get::<_,String>(1)?,
@@ -253,7 +253,7 @@ impl Mosh {
         let sql = format!(
             "{AUTHORITY}, visible_blocks AS MATERIALIZED (
                 SELECT k.key/4096 block,mosh_make_block(json_group_array(k.key%4096)) packed
-                FROM object_keys k JOIN objects o ON o.id=k.object
+                FROM object_keys k JOIN objects o ON o.key=k.key
                 WHERE o.missing=0 AND {VISIBLE} AND {readable} GROUP BY k.key/4096
             ) SELECT t.name,sum(mosh_block_count(b.packed,v.packed)) n FROM tag_blocks b
             JOIN visible_blocks v ON v.block=b.block JOIN tag_dictionary t ON t.id=b.tag
@@ -403,7 +403,7 @@ impl Mosh {
         if !self.permits(&selected, "paint")? {
             return Ok(None);
         }
-        Ok(self.db.query_row("SELECT level,body,revision,locked,origin FROM paint WHERE object=?",[selected.id],|r| {
+        Ok(self.db.query_row("SELECT level,body,revision,locked,origin FROM paint WHERE object=?",[selected.key],|r| {
             let revision = r.get::<_,i64>(2)?;
             Ok(json!({"level":r.get::<_,String>(0)?,"body":r.get::<_,String>(1)?,"revision":revision,
                 "stale":revision!=selected.revision,"locked":r.get::<_,bool>(3)?,"origin":r.get::<_,String>(4)?}))
@@ -420,11 +420,11 @@ impl Mosh {
         let before = self.paint(&selected.id)?;
         let tx = self.db.unchecked_transaction()?;
         if level == "none" {
-            tx.execute("DELETE FROM paint WHERE object=?", [&selected.id])?;
+            tx.execute("DELETE FROM paint WHERE object=?", [selected.key])?;
         } else {
             tx.execute("INSERT INTO paint VALUES(?,?,?,?,?, 'user') ON CONFLICT(object) DO UPDATE SET
                 level=excluded.level,body=excluded.body,revision=excluded.revision,locked=excluded.locked,origin='user'",
-                params![selected.id,level,body,selected.revision,locked])?;
+                params![selected.key,level,body,selected.revision,locked])?;
         }
         event(
             &tx,
@@ -453,7 +453,10 @@ impl Mosh {
             params![if marriage { 2 } else { 1 }, name.trim()],
             |row| row.get(0),
         )?;
-        tx.execute("INSERT INTO owners VALUES(?,?)", params![id, self.actor])?;
+        tx.execute(
+            "INSERT INTO owners VALUES(mosh_key(?),?)",
+            params![id, self.actor],
+        )?;
         event(
             &tx,
             Some(&id),
@@ -496,15 +499,15 @@ impl Mosh {
         )?;
         let cycle: bool = tx.query_row("WITH RECURSIVE reachable(id) AS (
             SELECT ?1 UNION SELECT e.target FROM edges e JOIN reachable r ON e.container=r.id WHERE e.kind<>'related'
-            UNION SELECT o.id FROM objects o JOIN reachable r ON o.parent=r.id WHERE o.missing=0
-        ) SELECT EXISTS(SELECT 1 FROM reachable WHERE id=?2)",params![target.id,container.id],|r|r.get(0))?;
+            UNION SELECT o.key FROM objects o JOIN reachable r ON o.parent_key=r.id WHERE o.missing=0
+        ) SELECT EXISTS(SELECT 1 FROM reachable WHERE id=?2)",params![target.key,container.key],|r|r.get(0))?;
         ensure!(
             kind == "related" || !cycle,
             "this relationship would create a cycle"
         );
         tx.execute(
             "INSERT OR IGNORE INTO edges VALUES(?,?,?,?)",
-            params![container.id, target.id, kind, selector.unwrap_or("")],
+            params![container.key, target.key, kind, selector.unwrap_or("")],
         )?;
         tx.commit()?;
         Ok(())
@@ -520,18 +523,18 @@ impl Mosh {
         crate::query::validate(query)?;
         self.db.execute(
             "INSERT OR IGNORE INTO collection_queries VALUES(?,?)",
-            params![selected.id, query],
+            params![selected.key, query],
         )?;
         Ok(())
     }
 
     pub fn graph(&self, reference: Option<&str>) -> Result<Vec<Value>> {
         let id = reference
-            .map(|reference| self.find(reference).map(|object| object.id))
+            .map(|reference| self.find(reference).map(|object| object.key))
             .transpose()?;
         let sql = format!(
-            "{AUTHORITY} SELECT o.*,e.kind AS edge_kind,e.selector,e.container AS source
-            FROM edges e JOIN objects o ON o.id=e.target
+            "{AUTHORITY} SELECT o.*,e.kind AS edge_kind,e.selector,mosh_public_id(e.container) AS source
+            FROM edges e JOIN objects o ON o.key=e.target
             WHERE o.missing=0 AND (?3 IS NULL OR e.container=?3 OR e.target=?3) AND {VISIBLE}
             ORDER BY e.container,e.target LIMIT 1000"
         );

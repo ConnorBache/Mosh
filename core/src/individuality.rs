@@ -73,14 +73,31 @@ pub(crate) fn skim(db: &Connection, actor: &str, key: i64) -> Result<Skim> {
                 std::path::MAIN_SEPARATOR_STR.to_owned().into(),
             ))
             .chain(clues.iter().copied().map(rusqlite::types::Value::Integer));
-        Ok(db
+        let (files, upper): (i64, i64) = db
             .prepare_cached(&format!(
-                "{authority} SELECT count(*),coalesce(sum(min(max(o.size,1),{PEEK_BYTES})),0)
+                "{authority} SELECT count(*),count(*) * {PEEK_BYTES}
             FROM objects o WHERE {scope} {filter}"
             ))?
             .query_row(rusqlite::params_from_iter(inputs), |r| {
                 Ok((r.get(0)?, r.get(1)?))
-            })?)
+            })?;
+        if files > SHORTLIST_FILES || files == 0 {
+            return Ok((files, upper));
+        }
+        let args = std::iter::once(actor.to_owned().into())
+            .chain(std::iter::once(
+                std::path::MAIN_SEPARATOR_STR.to_owned().into(),
+            ))
+            .chain(clues.iter().copied().map(rusqlite::types::Value::Integer));
+        let bytes = db
+            .prepare_cached(&format!(
+                "{authority}
+            SELECT coalesce(sum(min(max(coalesce(mosh_live_stat(
+                o.path,o.native_id,o.created,o.reparse,'size'),{PEEK_BYTES}),1),{PEEK_BYTES})),0)
+            FROM objects o WHERE {scope} {filter}"
+            ))?
+            .query_row(rusqlite::params_from_iter(args), |r| r.get(0))?;
+        Ok((files, bytes))
     };
     let fits = |(files, bytes): (i64, i64)| files <= SHORTLIST_FILES && bytes <= SHORTLIST_BYTES;
     let mut remaining = measure(&[])?;
@@ -210,7 +227,7 @@ pub(crate) fn structured_signals(source: &str) -> BTreeMap<String, String> {
 
 impl Mosh {
     pub fn individuality(&self, reference: &str) -> Result<Value> {
-        let file = self.find(reference)?;
+        let file = self.get(reference)?;
         ensure!(
             file.kind == "file" && self.permits(&file, "paint")?,
             "Individuality is unavailable"
@@ -230,7 +247,7 @@ impl Mosh {
         let authority = organization::AUTHORITY;
         let visible = organization::VISIBLE;
         let sql = format!(
-            "{authority} SELECT o.id FROM object_keys k JOIN objects o ON o.id=k.object
+            "{authority} SELECT o.id FROM object_keys k JOIN objects o ON o.key=k.key
             WHERE k.tag_set=(SELECT tag_set FROM object_keys WHERE key=?3)
             AND k.key<>?3 AND o.kind='file' AND o.missing=0 AND {visible} AND {read}
             ORDER BY k.key LIMIT 32"
@@ -241,7 +258,7 @@ impl Mosh {
             |r| r.get::<_, String>(0),
         )? {
             let id = id?;
-            if let Ok(object) = self.find(&id) {
+            if let Ok(object) = self.get(&id) {
                 candidates.insert(id, object);
             }
         }
@@ -385,7 +402,7 @@ impl Mosh {
     }
 
     pub fn vocabulary_advice(&self, reference: &str) -> Result<Value> {
-        let file = self.find(reference)?;
+        let file = self.get(reference)?;
         self.require_contents(&file)?;
         let individuality = self.individuality(&file.id)?;
         let key = tiers::key(&self.db, &file.id)?;

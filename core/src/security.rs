@@ -10,13 +10,13 @@ pub fn allowed(right: &str) -> String {
         "edit" => "g.permission='edit'",
         _ => "0",
     };
-    format!("(?1='local' OR NOT EXISTS(SELECT 1 FROM objects s LEFT JOIN coll_security p ON s.id=p.object
+    format!("(?1='local' OR NOT EXISTS(SELECT 1 FROM objects s LEFT JOIN coll_security p ON s.key=p.object
       WHERE (p.restricted=1 OR s.secret=1) AND s.missing=0 AND
-      (s.id=o.id OR (s.path IS NOT NULL AND o.path IS NOT NULL
+      (s.key=o.key OR (s.path IS NOT NULL AND o.path IS NOT NULL
         AND substr(o.path,1,length(rtrim(s.path,?2))+1)=rtrim(s.path,?2)||?2))
-      AND NOT EXISTS(SELECT 1 FROM owners w JOIN authority a ON a.person=w.person WHERE w.object=s.id)
-      AND NOT EXISTS(SELECT 1 FROM guests g WHERE g.object=s.id AND g.person=?1 AND {legacy})
-      AND NOT EXISTS(SELECT 1 FROM guest_rights g WHERE g.object=s.id AND g.person=?1 AND g.right='{right}')))")
+      AND NOT EXISTS(SELECT 1 FROM owners w JOIN authority a ON a.person=w.person WHERE w.object=s.key)
+      AND NOT EXISTS(SELECT 1 FROM guests g WHERE g.object=s.key AND g.person=?1 AND {legacy})
+      AND NOT EXISTS(SELECT 1 FROM guest_rights g WHERE g.object=s.key AND g.person=?1 AND g.right='{right}')))")
 }
 
 impl Mosh {
@@ -25,12 +25,16 @@ impl Mosh {
             return Ok(true);
         }
         let sql = format!(
-            "{AUTHORITY} SELECT {} FROM objects o WHERE id=?3",
+            "{AUTHORITY}, o(key,path) AS (VALUES(?3,?4)) SELECT {} FROM o",
             allowed(right)
         );
-        Ok(self.db.query_row(
-            &sql,
-            params![self.actor, std::path::MAIN_SEPARATOR_STR, object.id],
+        Ok(self.db.prepare_cached(&sql)?.query_row(
+            params![
+                self.actor,
+                std::path::MAIN_SEPARATOR_STR,
+                object.key,
+                object.path
+            ],
             |r| r.get(0),
         )?)
     }
@@ -50,7 +54,7 @@ impl Mosh {
     pub(crate) fn explicit_right(&self, object: &Object, right: &str) -> Result<bool> {
         Ok(self.db.query_row(
             "SELECT EXISTS(SELECT 1 FROM guest_rights WHERE object=? AND person=? AND right=?)",
-            params![object.id, self.actor, right],
+            params![object.key, self.actor, right],
             |r| r.get(0),
         )?)
     }
@@ -70,7 +74,7 @@ impl Mosh {
         let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
         if let Some(value) = restricted {
             tx.execute("INSERT INTO coll_security VALUES(?,?) ON CONFLICT DO UPDATE SET restricted=excluded.restricted",
-                params![item.id,value])?;
+                params![item.key,value])?;
         }
         if let Some(person) = person {
             ensure!(
@@ -83,7 +87,7 @@ impl Mosh {
             );
             tx.execute(
                 "DELETE FROM guest_rights WHERE object=? AND person=?",
-                params![item.id, person],
+                params![item.key, person],
             )?;
             for right in rights {
                 ensure!(
@@ -95,7 +99,7 @@ impl Mosh {
                 );
                 tx.execute(
                     "INSERT OR IGNORE INTO guest_rights VALUES(?,?,?)",
-                    params![item.id, person, right],
+                    params![item.key, person, right],
                 )?;
             }
         }
@@ -111,7 +115,7 @@ impl Mosh {
             )?;
         }
         let result=tx.query_row("SELECT coalesce((SELECT restricted FROM coll_security WHERE object=?1),0),
-            (SELECT json_group_array(json_object('person',person,'right',right)) FROM guest_rights WHERE object=?1)",[item.id],
+            (SELECT json_group_array(json_object('person',person,'right',right)) FROM guest_rights WHERE object=?1)",[item.key],
             |r|Ok(json!({"restricted":r.get::<_,bool>(0)?,"grants":serde_json::from_str::<Value>(&r.get::<_,String>(1)?).unwrap_or_default()})))?;
         tx.commit()?;
         Ok(result)

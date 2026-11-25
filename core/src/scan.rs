@@ -80,9 +80,7 @@ struct Previous {
     kind: String,
     native: Option<String>,
     created: Option<i64>,
-    modified: Option<i64>,
-    size: i64,
-    changed: Option<i64>,
+    scan_stamp: Option<Vec<u8>>,
     reparse: bool,
 }
 
@@ -93,20 +91,18 @@ fn previous(row: &rusqlite::Row<'_>) -> rusqlite::Result<Previous> {
         kind: row.get(2)?,
         native: fsmeta::unpack_id(row.get_ref(3)?)?,
         created: row.get(4)?,
-        modified: row.get(5)?,
-        size: row.get(6)?,
-        changed: row.get(7)?,
-        reparse: row.get(8)?,
-        key: row.get(9)?,
+        scan_stamp: row.get(5)?,
+        reparse: row.get(6)?,
+        key: row.get(7)?,
     })
 }
 
-const STAMP: &str = "id,path,kind,native_id,created,modified,size,changed,reparse,key";
+const STAMP: &str = "id,path,kind,native_id,created,scan_stamp,reparse,key";
 
 fn forgotten(db: &Connection, path: &str, full_scan: bool) -> Result<u64> {
     let (low, high) = prefix(path);
     let unseen = if full_scan {
-        "AND NOT EXISTS(SELECT 1 FROM scan_present WHERE scan_present.id=objects.id)"
+        "AND NOT EXISTS(SELECT 1 FROM scan_present WHERE scan_present.id=objects.key)"
     } else {
         ""
     };
@@ -115,7 +111,7 @@ fn forgotten(db: &Connection, path: &str, full_scan: bool) -> Result<u64> {
     db.execute(
         &format!(
             "INSERT INTO audit(time,object,action,previous,outcome)
-        SELECT ?4,id,'external-missing',json_object('path',path),'observed'
+        SELECT ?4,key,'external-missing',json_object('path',path),'observed'
         FROM objects WHERE {where_clause}"
         ),
         params![path, low, high, now()],
@@ -131,6 +127,8 @@ fn identity(
     path: &str,
     kind: &str,
     native: Option<&str>,
+    volume: Option<i64>,
+    native_ref: Option<&[u8]>,
     created: Option<i64>,
 ) -> Result<Option<Previous>> {
     let existing = db
@@ -152,22 +150,22 @@ fn identity(
         }
         forgotten(db, path, false)?;
     }
-    if let Some(native) = native {
+    if let Some((volume, native_ref)) = volume.zip(native_ref) {
         let suspended=db.prepare_cached(&format!("SELECT {STAMP} FROM objects
-            WHERE path=?1 AND missing=1 AND native_id=?2 AND kind=?3 AND created IS ?4
-            AND id IN(SELECT k.object FROM nested_suspended s JOIN object_keys k ON s.object_key=k.key
-                WHERE s.child IS NULL) LIMIT 2"))?.query_map(params![path,fsmeta::pack_id(native),kind,created],previous)?
+            WHERE path=?1 AND missing=1 AND native_volume=?2 AND native_ref=?3 AND kind=?4 AND created IS ?5
+            AND key IN(SELECT object_key FROM nested_suspended WHERE child IS NULL) LIMIT 2"))?
+            .query_map(params![path, volume, native_ref, kind, created],previous)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         if suspended.len() == 1 {
             return Ok(suspended.into_iter().next());
         }
     }
-    let Some((native, created)) = native.zip(created) else {
+    let Some(((volume, native_ref), created)) = volume.zip(native_ref).zip(created) else {
         return Ok(None);
     };
-    let mut stmt = db.prepare_cached(&format!("SELECT {STAMP} FROM objects WHERE native_id=? AND created=? AND kind=? AND missing=0 LIMIT 3"))?;
+    let mut stmt = db.prepare_cached(&format!("SELECT {STAMP} FROM objects WHERE native_volume=? AND native_ref=? AND created=? AND kind=? AND missing=0 LIMIT 3"))?;
     let candidates = stmt
-        .query_map(params![fsmeta::pack_id(native), created, kind], previous)?
+        .query_map(params![volume, native_ref, created, kind], previous)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     if candidates.len() != 1 {
         return Ok(None);
@@ -227,10 +225,10 @@ fn index_one(
         .and_then(Path::to_str)
         .map(|parent| {
             db.prepare_cached(
-                "SELECT id FROM objects WHERE missing=0 AND path IS NOT NULL
+                "SELECT key FROM objects WHERE missing=0 AND path IS NOT NULL
                 AND mosh_path_key(path)=mosh_path_key(?1) AND path=?1",
             )?
-            .query_row([parent], |r| r.get::<_, String>(0))
+            .query_row([parent], |r| r.get::<_, i64>(0))
             .optional()
         })
         .transpose()?
@@ -242,12 +240,19 @@ fn index_one(
     } else {
         0
     };
-    let previous = identity(db, key, kind, native.id.as_deref(), created)?;
+    let (volume, file_id) = fsmeta::native_parts(db, native.id.as_deref())?;
+    let stamp = fsmeta::scan_stamp(size, modified, native.changed);
+    let previous = identity(
+        db,
+        key,
+        kind,
+        native.id.as_deref(),
+        volume,
+        file_id.as_deref(),
+        created,
+    )?;
     let changed = previous.as_ref().is_none_or(|old| {
-        old.size != size
-            || old.modified != modified
-            || old.changed != native.changed
-            || old.reparse != is_reparse
+        old.scan_stamp.as_deref() != Some(stamp.as_slice()) || old.reparse != is_reparse
     });
     let renamed = previous.as_ref().is_some_and(|old| old.path != key);
     let new = previous.is_none();
@@ -263,44 +268,42 @@ fn index_one(
         .flatten()
         .and_then(|p| p.to_str().map(str::to_owned));
     let (folder, literal) = crate::lean::store_location(db, key, name, kind == "file")?;
-    db.prepare_cached("INSERT INTO objects(key,kind_code,path_literal,parent,name,path_folder,size,created,modified,changed,native_id,reparse,link_target)
-        VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
-        ON CONFLICT(key) DO UPDATE SET path_literal=?3,parent=?4,name=?5,path_folder=?6,size=?7,created=?8,modified=?9,
-        changed=?10,native_id=coalesce(?11,native_id),reparse=?12,link_target=?13,revision=revision+?14,missing=0,
-        hash=CASE WHEN ?14=1 THEN NULL ELSE hash END")?
-        .execute(params![object_key,i64::from(meta.is_dir()),literal,parent,name,folder,size,created,modified,native.changed,
-            native.id.as_deref().map(fsmeta::pack_id),is_reparse,link_target,changed])?;
+    db.prepare_cached("INSERT INTO objects(key,kind_code,path_literal,parent_key,name,path_folder,scan_stamp,created,native_volume,native_ref,reparse,link_target)
+        VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+        ON CONFLICT(key) DO UPDATE SET path_literal=?3,parent_key=?4,name=?5,path_folder=?6,scan_stamp=?7,
+        created=coalesce(?8,created),native_volume=coalesce(?9,native_volume),native_ref=coalesce(?10,native_ref),
+        reparse=?11,link_target=?12,revision=revision+?13,missing=0,
+        hash=CASE WHEN ?13=1 THEN NULL ELSE hash END")?
+        .execute(params![object_key,i64::from(meta.is_dir()),literal,parent,name,folder,stamp.as_slice(),created,
+            volume,file_id,is_reparse,link_target,changed])?;
     if full_scan {
         db.prepare_cached("INSERT OR IGNORE INTO scan_present VALUES(?)")?
-            .execute([&id])?;
+            .execute([object_key])?;
     }
-    db.prepare_cached(
-        "DELETE FROM nested_suspended WHERE child IS NULL AND
-        object_key=(SELECT key FROM object_keys WHERE object=?)",
-    )?
-    .execute([&id])?;
+    db.prepare_cached("DELETE FROM nested_suspended WHERE child IS NULL AND object_key=?")?
+        .execute([object_key])?;
     if new && kind == "coll" {
         db.prepare_cached("INSERT INTO owners VALUES(?,?)")?
-            .execute(params![id, actor])?;
+            .execute(params![object_key, actor])?;
         let (low, high) = prefix(key);
-        db.prepare_cached("UPDATE objects SET parent=?1 WHERE parent IS NULL AND path>=?2 AND path<?3 AND missing=0
-            AND instr(substr(path,length(?2)+1),?4)=0")?.execute(params![id,low,high,std::path::MAIN_SEPARATOR_STR])?;
+        db.prepare_cached("UPDATE objects SET parent_key=?1 WHERE parent_key IS NULL AND path>=?2 AND path<?3 AND missing=0
+            AND instr(substr(path,length(?2)+1),?4)=0")?.execute(params![object_key,low,high,std::path::MAIN_SEPARATOR_STR])?;
     }
     if new || renamed {
         let ids = deterministic_tags(&extension, kind, fsmeta::mime(Some(&extension)))
             .iter()
             .map(|name| crate::organization::dictionary_id(db, name))
             .collect::<Result<Vec<_>>>()?;
-        tag_writer.filesystem(&id, &ids)?;
+        tag_writer.filesystem(object_key, &ids)?;
     }
     if kind == "file" && (changed || renamed) {
         if changed && !new {
             let revision: i64 = db
-                .prepare_cached("SELECT revision FROM objects WHERE id=?")?
-                .query_row([&id], |row| row.get(0))?;
-            tag_writer.invalidate_enrichment(&id, revision - 1)?;
+                .prepare_cached("SELECT revision FROM objects WHERE key=?")?
+                .query_row([object_key], |row| row.get(0))?;
+            tag_writer.invalidate_enrichment(object_key, revision - 1)?;
         }
-        crate::tiers::indexed(db, &id)?;
+        crate::tiers::indexed(db, object_key)?;
     }
     if renamed {
         let before = previous.map(|old| json!({"path":old.path}));
@@ -351,7 +354,6 @@ impl Mosh {
             params![path_text(&root)?, now()],
         )?;
         let report = self.walk(&tx, &root, cancel)?;
-        crate::content::trim_after_invalidation(&tx)?;
         tx.commit()?;
         self.apply_rules()?;
         Ok(report)
@@ -362,7 +364,7 @@ impl Mosh {
         let boundaries = crate::nested::boundaries(db)?;
         let boundary_ids = crate::nested::boundary_ids(db)?;
         db.execute_batch(
-            "CREATE TEMP TABLE IF NOT EXISTS scan_present(id TEXT PRIMARY KEY) WITHOUT ROWID;
+            "CREATE TEMP TABLE IF NOT EXISTS scan_present(id INTEGER PRIMARY KEY) WITHOUT ROWID;
             DELETE FROM scan_present;",
         )?;
         let mut report = ScanReport::default();
@@ -543,7 +545,6 @@ impl Mosh {
             },
             Err(error) => return Err(error.into()),
         };
-        crate::content::trim_after_invalidation(&tx)?;
         tx.commit()?;
         Ok(report)
     }

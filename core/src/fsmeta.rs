@@ -1,7 +1,8 @@
 use crate::millis;
 use rusqlite::{
-    Connection,
+    Connection, OptionalExtension,
     functions::FunctionFlags,
+    params,
     types::{Value, ValueRef},
 };
 use std::{
@@ -38,7 +39,7 @@ pub(crate) mod win {
         mem::{self, MaybeUninit},
         os::windows::{
             fs::{MetadataExt, OpenOptionsExt},
-            io::AsRawHandle,
+            io::{AsRawHandle, FromRawHandle},
         },
     };
     use windows_sys::Win32::{Foundation::HANDLE, Storage::FileSystem::*};
@@ -170,6 +171,91 @@ pub(crate) mod win {
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
             .open(path)
     }
+
+    pub(crate) fn path_by_id(path: &Path, id: &str, birth: i64) -> Option<std::path::PathBuf> {
+        use std::{ffi::OsString, os::windows::ffi::OsStringExt};
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+
+        let (volume, key) = id.split_once(':')?;
+        if volume.len() != 16 || key.len() != 32 {
+            return None;
+        }
+        let volume = u64::from_str_radix(volume, 16).ok()?;
+        let key = u128::from_str_radix(key, 16).ok()?;
+        let hint = path.ancestors().skip(1).find_map(|ancestor| {
+            let file = attr_file(ancestor, 0).ok()?;
+            let hint = read_info::<FILE_ID_INFO>(file.as_raw_handle(), FileIdInfo)?;
+            (hint.VolumeSerialNumber == volume).then_some(file)
+        })?;
+        let open = |kind, descriptor| {
+            let id = FILE_ID_DESCRIPTOR {
+                dwSize: mem::size_of::<FILE_ID_DESCRIPTOR>() as u32,
+                Type: kind,
+                Anonymous: descriptor,
+            };
+            // Request attributes only. The resolved path is checked by Mosh before use.
+            let handle = unsafe {
+                OpenFileById(
+                    hint.as_raw_handle(),
+                    &id,
+                    FILE_READ_ATTRIBUTES,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    std::ptr::null(),
+                    FILE_FLAG_OPEN_REPARSE_POINT,
+                )
+            };
+            (handle != INVALID_HANDLE_VALUE).then(|| unsafe { File::from_raw_handle(handle) })
+        };
+        let file = open(
+            ExtendedFileIdType,
+            FILE_ID_DESCRIPTOR_0 {
+                ExtendedFileId: FILE_ID_128 {
+                    Identifier: key.to_le_bytes(),
+                },
+            },
+        )
+        .or_else(|| {
+            let file = u64::try_from(key).ok()?;
+            open(
+                FileIdType,
+                FILE_ID_DESCRIPTOR_0 {
+                    FileId: file as i64,
+                },
+            )
+        })?;
+        let handle = file.as_raw_handle();
+        let identity = read_info::<FILE_ID_INFO>(handle, FileIdInfo)?;
+        let standard = read_info::<FILE_STANDARD_INFO>(handle, FileStandardInfo)?;
+        let meta = file.metadata().ok()?;
+        if identity.VolumeSerialNumber != volume
+            || u128::from_le_bytes(identity.FileId.Identifier) != key
+            || standard.NumberOfLinks != 1
+            || !meta.is_file()
+            || reparse(&meta)
+            || meta.created().ok().map(millis) != Some(birth)
+        {
+            return None;
+        }
+        let mut buffer = vec![0u16; 512];
+        loop {
+            let count = unsafe {
+                GetFinalPathNameByHandleW(
+                    handle,
+                    buffer.as_mut_ptr(),
+                    buffer.len() as u32,
+                    FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+                )
+            } as usize;
+            if count == 0 || count > 32_768 {
+                return None;
+            }
+            if count < buffer.len() {
+                let path = std::path::PathBuf::from(OsString::from_wide(&buffer[..count]));
+                return Some(dunce::simplified(&path).to_owned());
+            }
+            buffer.resize(count + 1, 0);
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -250,6 +336,55 @@ pub(crate) fn unpack_id(value: ValueRef<'_>) -> rusqlite::Result<Option<String>>
     }
 }
 
+fn split_id(id: &str) -> (String, Vec<u8>) {
+    if let Some((volume, file)) = id.split_once(':') {
+        if volume.len() == 16
+            && file.len() == 32
+            && let (Ok(volume), Ok(file)) = (
+                u64::from_str_radix(volume, 16),
+                u128::from_str_radix(file, 16),
+            )
+        {
+            let full = file.to_be_bytes();
+            let start = full.iter().position(|&byte| byte != 0).unwrap_or(15);
+            return (format!("w{volume:016x}"), full[start..].to_vec());
+        }
+        if let (Ok(volume), Ok(file)) = (volume.parse::<u64>(), file.parse::<u64>()) {
+            let full = file.to_be_bytes();
+            let start = full.iter().position(|&byte| byte != 0).unwrap_or(7);
+            return (format!("u{volume}"), full[start..].to_vec());
+        }
+    }
+    ("?".into(), id.as_bytes().to_vec())
+}
+
+pub(crate) fn native_parts(
+    db: &Connection,
+    id: Option<&str>,
+) -> rusqlite::Result<(Option<i64>, Option<Vec<u8>>)> {
+    let Some(id) = id else {
+        return Ok((None, None));
+    };
+    let (volume, file) = split_id(id);
+    let mut find = db.prepare_cached("SELECT id FROM native_volumes WHERE identity=?")?;
+    let key = match find.query_row([&volume], |row| row.get(0)).optional()? {
+        Some(key) => key,
+        None => db
+            .prepare_cached("INSERT INTO native_volumes(identity) VALUES(?) RETURNING id")?
+            .query_row([&volume], |row| row.get(0))?,
+    };
+    Ok((Some(key), Some(file)))
+}
+
+pub(crate) fn scan_stamp(size: i64, modified: Option<i64>, changed: Option<i64>) -> [u8; 8] {
+    let mut input = [0u8; 25];
+    input[0..8].copy_from_slice(&size.to_le_bytes());
+    input[8..16].copy_from_slice(&modified.unwrap_or_default().to_le_bytes());
+    input[16..24].copy_from_slice(&changed.unwrap_or_default().to_le_bytes());
+    input[24] = u8::from(modified.is_some()) | (u8::from(changed.is_some()) << 1);
+    blake3::hash(&input).as_bytes()[..8].try_into().unwrap()
+}
+
 pub(crate) fn mime(extension: Option<&str>) -> Option<&'static str> {
     extension.and_then(|extension| mime_guess::from_ext(extension).first_raw())
 }
@@ -277,9 +412,23 @@ fn live(
     Some((meta, native))
 }
 
-pub(crate) fn populate(object: &mut crate::Object) {
+pub(crate) fn populate(object: &mut crate::Object) -> bool {
+    let found = populate_basic(object);
+    if found {
+        #[cfg(windows)]
+        {
+            object.filesystem = object
+                .path
+                .as_deref()
+                .and_then(|path| win::filesystem(Path::new(path)));
+        }
+    }
+    found
+}
+
+pub(crate) fn populate_basic(object: &mut crate::Object) -> bool {
     let Some(path) = object.path.as_deref().map(Path::new) else {
-        return;
+        return false;
     };
     let Some((meta, native)) = live(
         path,
@@ -287,20 +436,85 @@ pub(crate) fn populate(object: &mut crate::Object) {
         object.created,
         object.reparse,
     ) else {
-        return;
+        return false;
     };
     object.accessed = meta.accessed().ok().map(millis);
+    object.size = object
+        .kind
+        .eq("file")
+        .then(|| meta.len() as i64)
+        .unwrap_or_default();
+    object.created = meta.created().ok().map(millis);
+    object.modified = meta.modified().ok().map(millis);
+    object.changed = native.changed;
     object.allocated = native.allocated;
     object.attributes = native.attributes;
     object.volume = native.volume;
     object.hardlinks = native.hardlinks;
-    #[cfg(windows)]
-    {
-        object.filesystem = win::filesystem(path);
-    }
+    true
+}
+
+pub(crate) fn matches_indexed(object: &crate::Object, path: &Path) -> bool {
+    let Some((meta, native)) = live(
+        path,
+        object.native_id.as_deref(),
+        object.created,
+        object.reparse,
+    ) else {
+        return false;
+    };
+    let (size, modified, _) = revision_stamp(&meta);
+    let Ok(size) = i64::try_from(size) else {
+        return false;
+    };
+    object.scan_stamp.as_deref() == Some(scan_stamp(size, modified, native.changed).as_slice())
 }
 
 pub(crate) fn register(db: &Connection) -> rusqlite::Result<()> {
+    let pure = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC;
+    db.create_scalar_function("mosh_scan_stamp", 3, pure, |ctx| {
+        Ok(scan_stamp(ctx.get(0)?, ctx.get(1)?, ctx.get(2)?).to_vec())
+    })?;
+    db.create_scalar_function("mosh_native_volume", 1, pure, |ctx| {
+        Ok(unpack_id(ctx.get_raw(0))?.map(|id| split_id(&id).0))
+    })?;
+    db.create_scalar_function("mosh_native_ref", 1, pure, |ctx| {
+        Ok(unpack_id(ctx.get_raw(0))?.map(|id| split_id(&id).1))
+    })?;
+    db.create_scalar_function(
+        "mosh_native_identity",
+        2,
+        pure | FunctionFlags::SQLITE_INNOCUOUS,
+        |ctx| {
+            let (Some(key), Some(file)) =
+                (ctx.get::<Option<i64>>(0)?, ctx.get::<Option<Vec<u8>>>(1)?)
+            else {
+                return Ok(None);
+            };
+            let db = unsafe { ctx.get_connection()? };
+            let volume: String = db
+                .prepare_cached("SELECT identity FROM native_volumes WHERE id=?")?
+                .query_row(params![key], |row| row.get(0))?;
+            if volume == "?" {
+                return String::from_utf8(file)
+                    .map(Some)
+                    .map_err(|_| rusqlite::Error::InvalidQuery);
+            }
+            if file.len() > 16 || volume.is_empty() {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            let number = file
+                .into_iter()
+                .fold(0u128, |key, byte| (key << 8) | u128::from(byte));
+            Ok(Some(if let Some(volume) = volume.strip_prefix('w') {
+                format!("{volume}:{number:032x}")
+            } else if let Some(volume) = volume.strip_prefix('u') {
+                format!("{volume}:{number}")
+            } else {
+                return Err(rusqlite::Error::InvalidQuery);
+            }))
+        },
+    )?;
     db.create_scalar_function(
         "mosh_mime",
         1,
@@ -319,6 +533,28 @@ pub(crate) fn register(db: &Connection) -> rusqlite::Result<()> {
             Ok(path
                 .and_then(|path| live(Path::new(&path), id.as_deref(), created, link))
                 .and_then(|(_, native)| native.allocated))
+        },
+    )?;
+    db.create_scalar_function(
+        "mosh_live_stat",
+        5,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DIRECTONLY,
+        |ctx| {
+            let path: Option<String> = ctx.get(0)?;
+            let id = unpack_id(ctx.get_raw(1))?;
+            let created = ctx.get(2)?;
+            let link = ctx.get(3)?;
+            let field: String = ctx.get(4)?;
+            Ok(path
+                .and_then(|path| live(Path::new(&path), id.as_deref(), created, link))
+                .and_then(|(meta, native)| match field.as_str() {
+                    "size" => Some(if meta.is_dir() { 0 } else { meta.len() as i64 }),
+                    "created" => meta.created().ok().map(millis),
+                    "modified" => meta.modified().ok().map(millis),
+                    "accessed" => meta.accessed().ok().map(millis),
+                    "changed" => native.changed,
+                    _ => None,
+                }))
         },
     )
 }

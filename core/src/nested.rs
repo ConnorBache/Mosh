@@ -208,13 +208,12 @@ impl Mosh {
             native_id=excluded.native_id,native_created=excluded.native_created",
             params![child,name.trim(),paint,serde_json::to_string(&tags)?,path_text(&attachment)?,path_text(&root)?,
                 crate::fsmeta::native(&root,&meta).id,meta.created().ok().map(crate::millis)])?;
-        tx.execute("INSERT OR IGNORE INTO nested_suspended SELECT ?1,k.key FROM objects o JOIN object_keys k ON k.object=o.id
+        tx.execute("INSERT OR IGNORE INTO nested_suspended SELECT ?1,k.key FROM objects o JOIN object_keys k ON k.key=o.key
             WHERE o.missing=0 AND mosh_within_path(o.path,?2)",params![child,path_text(&root)?])?;
         tx.execute(
             "UPDATE objects SET missing=1 WHERE missing=0 AND mosh_within_path(path,?)",
             [path_text(&root)?],
         )?;
-        crate::metadata_search::rebuild_directories(&tx)?;
         event(
             &tx,
             None,
@@ -271,7 +270,6 @@ impl Mosh {
             tx.execute("DELETE FROM nested_moshes WHERE child=?", [child])? == 1,
             "attachment is unavailable"
         );
-        crate::metadata_search::rebuild_directories(&tx)?;
         event(
             &tx,
             None,

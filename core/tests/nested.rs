@@ -21,7 +21,6 @@ fn nested_moshes_keep_boundaries_and_authorize_each_handoff() -> Result<()> {
     let grand = Mosh::open(&grand_path)?;
     let cancel = AtomicBool::new(false);
     parent.scan(&root, &cancel)?;
-    assert_eq!(parent.doctor()?["directory_documents"], 2);
     child.scan(&child_root, &cancel)?;
     grand.scan(&grand_root, &cancel)?;
     let remembered = parent.get(child_file.to_str().unwrap())?.id;
@@ -43,7 +42,6 @@ fn nested_moshes_keep_boundaries_and_authorize_each_handoff() -> Result<()> {
         "Routing notes",
         &["maintenance".into()],
     )?;
-    assert_eq!(parent.doctor()?["directory_documents"], 0);
     assert!(
         parent
             .register_child(&grand_path, &grand_root, "Overlap", "", &[])

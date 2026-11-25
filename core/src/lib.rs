@@ -39,10 +39,14 @@ pub struct Mosh {
     actor: String,
 }
 
-const LEDGER_VERSION: i64 = 11;
+const LEDGER_VERSION: i64 = 12;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Object {
+    #[serde(skip)]
+    pub(crate) key: i64,
+    #[serde(skip)]
+    pub(crate) scan_stamp: Option<Vec<u8>>,
     pub id: String,
     pub kind: String,
     pub path: Option<String>,
@@ -76,6 +80,8 @@ fn object(row: &Row<'_>) -> rusqlite::Result<Object> {
     let mime: Option<String> = row.get("mime")?;
     let mime = mime.or_else(|| fsmeta::mime(extension.as_deref()).map(str::to_owned));
     Ok(Object {
+        key: row.get("key")?,
+        scan_stamp: row.get("scan_stamp")?,
         id: row.get("id")?,
         kind: row.get("kind")?,
         path: row.get("path")?,
@@ -83,12 +89,12 @@ fn object(row: &Row<'_>) -> rusqlite::Result<Object> {
         name: row.get("name")?,
         extension,
         mime,
-        size: row.get("size")?,
+        size: 0,
         allocated: None,
         created: row.get("created")?,
-        modified: row.get("modified")?,
+        modified: None,
         accessed: None,
-        changed: row.get("changed")?,
+        changed: None,
         attributes: None,
         native_id: fsmeta::unpack_id(row.get_ref("native_id")?)?,
         volume: None,
@@ -162,7 +168,7 @@ pub(crate) fn event(
     after: Option<&Value>,
     outcome: &str,
 ) -> Result<()> {
-    db.execute("INSERT INTO audit(time,object,action,actor,previous,current,outcome) VALUES(?,?,?,?,?,?,?)",
+    db.execute("INSERT INTO audit(time,object,action,actor,previous,current,outcome) VALUES(?,mosh_key(?),?,?,?,?,?)",
         params![now(),id,action,actor,before.map(Value::to_string),after.map(Value::to_string),outcome])?;
     Ok(())
 }
@@ -229,7 +235,7 @@ impl Mosh {
             }
             if locked_version < 10 {
                 tx.execute_batch(include_str!("ledger_v10.sql"))?;
-                metadata_search::rebuild(&tx)?;
+                metadata_search::rebuild_v10(&tx)?;
             }
             if locked_version < 10 {
                 tx.pragma_update(None, "user_version", 10)?;
@@ -246,6 +252,9 @@ impl Mosh {
             );
             if current == 10 {
                 lean::consolidate_keys(&tx)?;
+            }
+            if current <= 11 {
+                lean::slim_files(&tx)?;
                 tx.pragma_update(None, "user_version", LEDGER_VERSION)?;
             }
             tx.commit()?;
@@ -279,24 +288,85 @@ impl Mosh {
     pub fn get(&self, reference: &str) -> Result<Object> {
         let mut selected = self.find(reference)?;
         if self.permits(&selected, "paint")? {
-            fsmeta::populate(&mut selected);
+            if !fsmeta::populate(&mut selected) {
+                #[cfg(windows)]
+                if self.recover_windows_path(&mut selected, "paint")? {
+                    fsmeta::populate(&mut selected);
+                }
+            }
         }
         Ok(selected)
     }
 
-    pub(crate) fn find(&self, reference: &str) -> Result<Object> {
-        let by_key = |key: &str| {
-            self.db
-                .prepare_cached("SELECT * FROM objects WHERE id=? AND missing=0")?
-                .query_row([key], object)
-                .optional()
-        };
-        let mut by_id = by_key(reference)?;
-        if by_id.is_none()
-            && let Some(alias) = lean::resolve(&self.db, reference)?
-        {
-            by_id = by_key(&alias)?;
+    #[cfg(windows)]
+    fn recover_windows_path(&self, selected: &mut Object, right: &str) -> Result<bool> {
+        if selected.kind != "file" || selected.reparse {
+            return Ok(false);
         }
+        let Some((path, native, birth)) = selected
+            .path
+            .as_deref()
+            .zip(selected.native_id.as_deref())
+            .zip(selected.created)
+            .map(|((path, native), birth)| (path, native, birth))
+        else {
+            return Ok(false);
+        };
+        let Some(found) = fsmeta::win::path_by_id(Path::new(path), native, birth) else {
+            return Ok(false);
+        };
+        let Some(found) = found.to_str().filter(|found| *found != path) else {
+            return Ok(false);
+        };
+        // The old location was checked by find. A rename can also cross a restricted Coll or
+        // a nested Mosh boundary, so check the proposed path before returning it or reading it.
+        let visible = organization::VISIBLE;
+        let readable = security::allowed(right);
+        let auth = organization::AUTHORITY;
+        let accepted: bool = self
+            .db
+            .prepare_cached(&format!(
+                "{auth}, o(key,path) AS (VALUES(?3,?4))
+             SELECT {visible} AND {readable} AND EXISTS (
+                 SELECT 1 FROM roots WHERE mosh_within_path(o.path,roots.path)
+             ) FROM o"
+            ))?
+            .query_row(
+                params![
+                    self.actor,
+                    std::path::MAIN_SEPARATOR_STR,
+                    selected.key,
+                    found
+                ],
+                |row| row.get(0),
+            )?;
+        if accepted && let Some(name) = Path::new(found).file_name().and_then(|name| name.to_str())
+        {
+            selected.path = Some(found.to_owned());
+            selected.name = name.to_owned();
+            let extension = lean::file_extension(name, true);
+            selected.mime = fsmeta::mime(Some(&extension)).map(str::to_owned);
+            selected.extension = Some(extension);
+            selected.parent = Path::new(found)
+                .parent()
+                .and_then(Path::to_str)
+                .and_then(|path| self.find(path).ok())
+                .map(|parent| parent.id);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    pub(crate) fn find(&self, reference: &str) -> Result<Object> {
+        let by_id = lean::resolve(&self.db, reference)?
+            .map(|key| {
+                self.db
+                    .prepare_cached("SELECT * FROM objects WHERE key=? AND missing=0")?
+                    .query_row([key], object)
+                    .optional()
+            })
+            .transpose()?
+            .flatten();
         let selected = match by_id {
             Some(selected) => Some(selected),
             None => {
@@ -347,7 +417,7 @@ impl Mosh {
             .prepare("SELECT person FROM owners WHERE object=? ORDER BY person")?;
         let owners = if readable {
             owners
-                .query_map([&selected.id], |row| row.get::<_, String>(0))?
+                .query_map([selected.key], |row| row.get::<_, String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         } else {
             vec![]
@@ -363,15 +433,15 @@ impl Mosh {
         self.admin()?;
         let selected = reference.map(|value| self.get(value)).transpose()?;
         let mut statement = self.db.prepare(
-            "SELECT time,object,action,actor,previous,current,outcome FROM audit
+            "SELECT time,mosh_public_id(object),action,actor,previous,current,outcome FROM audit
              WHERE (?1 IS NULL OR object=?1 OR seq IN(
                  SELECT event FROM tag_audit_members WHERE mosh_keys_contains(keys,
-                     (SELECT key FROM object_keys WHERE object=?1))
+                     ?1)
              ))
              ORDER BY seq DESC LIMIT ?2",
         )?;
         let rows = statement.query_map(
-            params![selected.as_ref().map(|o| &o.id), limit.clamp(1, 1000)],
+            params![selected.as_ref().map(|o| o.key), limit.clamp(1, 1000)],
             |row| {
                 let decode = |index| -> rusqlite::Result<Value> {
                     Ok(row

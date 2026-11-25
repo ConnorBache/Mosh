@@ -126,11 +126,37 @@ pub(crate) fn alias_value(id: &str) -> Value {
     Value::Text(id.to_owned())
 }
 
-pub(crate) fn resolve(db: &Connection, reference: &str) -> Result<Option<String>> {
-    Ok(db
-        .prepare_cached("SELECT object FROM legacy_object_ids WHERE alias=?")?
-        .query_row([alias_value(reference)], |row| row.get(0))
-        .optional()?)
+fn decode_key(reference: &str) -> Option<i64> {
+    let digits = reference.strip_prefix('@')?;
+    let key = digits.bytes().try_fold(0i64, |key, digit| {
+        let value = match digit {
+            b'0'..=b'9' => digit - b'0',
+            b'a'..=b'z' => digit - b'a' + 10,
+            b'A'..=b'Z' => digit - b'A' + 36,
+            _ => return None,
+        };
+        key.checked_mul(62)?.checked_add(i64::from(value))
+    })?;
+    (key > 0 && !digits.starts_with('0')).then_some(key)
+}
+
+pub(crate) fn resolve(db: &Connection, reference: &str) -> rusqlite::Result<Option<i64>> {
+    if let Some(key) = decode_key(reference)
+        && let Some(found) = db
+            .prepare_cached(
+                "SELECT key FROM objects WHERE key=?1 AND (legacy_id IS NULL OR legacy_id=?2)",
+            )?
+            .query_row(params![key, reference], |row| row.get(0))
+            .optional()?
+    {
+        return Ok(Some(found));
+    }
+    db.prepare_cached(
+        "SELECT key FROM objects WHERE legacy_id=?1
+         UNION ALL SELECT object FROM legacy_object_ids WHERE alias=?2 LIMIT 1",
+    )?
+    .query_row(params![reference, alias_value(reference)], |row| row.get(0))
+    .optional()
 }
 
 fn parent_prefix<'a>(path: &'a str, name: &str) -> Option<&'a str> {
@@ -208,6 +234,23 @@ pub(crate) fn register(db: &Connection) -> Result<()> {
     db.create_scalar_function("mosh_object_id", 1, generated, |ctx| {
         Ok(ctx.get::<Option<i64>>(0)?.map(|key| encode_key(key as u64)))
     })?;
+    db.create_scalar_function("mosh_key", 1, flags, |ctx| {
+        let Some(reference) = ctx.get::<Option<String>>(0)? else {
+            return Ok(None);
+        };
+        // The lookup stays on this connection and in the caller's snapshot.
+        let db = unsafe { ctx.get_connection()? };
+        resolve(&db, &reference)
+    })?;
+    db.create_scalar_function("mosh_public_id", 1, generated, |ctx| {
+        let Some(key) = ctx.get::<Option<i64>>(0)? else {
+            return Ok(None);
+        };
+        let db = unsafe { ctx.get_connection()? };
+        db.prepare_cached("SELECT id FROM objects WHERE key=?")?
+            .query_row([key], |row| row.get::<_, String>(0))
+            .optional()
+    })?;
     db.create_scalar_function("mosh_legacy_id", 1, flags, |ctx| {
         Ok(alias_value(ctx.get::<String>(0)?.as_str()))
     })?;
@@ -238,6 +281,111 @@ fn schema_for(db: &Connection, table: &str, triggers: bool) -> Result<Vec<String
     Ok(query
         .query_map(params![table, triggers], |row| row.get(0))?
         .collect::<rusqlite::Result<_>>()?)
+}
+
+pub(crate) fn slim_files(db: &Connection) -> Result<()> {
+    db.execute_batch(
+        "DROP TRIGGER ledger_insert; DROP TRIGGER ledger_update; DROP TRIGGER text_invalidate;
+         DROP TRIGGER paint_insert; DROP TRIGGER paint_update; DROP TRIGGER paint_delete;
+         DROP TRIGGER path_search_directory_insert; DROP TRIGGER path_search_directory_delete;
+         DROP TRIGGER path_search_root_insert; DROP TRIGGER path_search_root_delete;
+         DROP TABLE ledger; DROP TABLE directory_fts; DROP TABLE text_terms; DROP TABLE text_cached;
+         DELETE FROM metadata WHERE key='text_budget';",
+    )?;
+    let sequence: Option<i64> = db
+        .query_row(
+            "SELECT seq FROM sqlite_sequence WHERE name='objects'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let old_links = db.prepare(
+        "SELECT name,sql FROM sqlite_schema s WHERE type='table' AND EXISTS(
+            SELECT 1 FROM pragma_foreign_key_list(s.name) fk WHERE fk.[table]='objects' AND fk.[to]='id')",
+    )?.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let object_schema = schema_for(db, "objects", true)?;
+    db.execute_batch(include_str!("ledger_v12_objects.sql"))?;
+    for (table, original) in old_links {
+        let columns = db
+            .prepare("SELECT name FROM pragma_table_info(?) ORDER BY cid")?
+            .query_map([&table], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let references = db.prepare(
+            "SELECT [from] FROM pragma_foreign_key_list(?) WHERE [table]='objects' AND [to]='id'",
+        )?.query_map([&table], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut definition = original[original.find('(').context("missing table definition")?..]
+            .replace("REFERENCES objects(id)", "REFERENCES objects(key)");
+        for column in &references {
+            let old = format!("{column} TEXT");
+            ensure!(
+                definition.contains(&old),
+                "missing reference definition for {table}.{column}"
+            );
+            definition = definition.replace(&old, &format!("{column} INTEGER"));
+        }
+        let projection = columns
+            .iter()
+            .map(|column| {
+                if references.contains(column) {
+                    format!("(SELECT key FROM objects WHERE id=old.\"{column}\")")
+                } else {
+                    format!("old.\"{column}\"")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let related = schema_for(db, &table, true)?;
+        db.execute_batch(&format!(
+            "CREATE TABLE mosh_rebind{definition};
+             INSERT INTO mosh_rebind SELECT {projection} FROM \"{table}\" old;
+             DROP TABLE \"{table}\"; ALTER TABLE mosh_rebind RENAME TO \"{table}\";"
+        ))?;
+        for statement in related {
+            db.execute_batch(&statement)?;
+        }
+    }
+    db.execute_batch("DROP TABLE objects; ALTER TABLE objects_next RENAME TO objects;
+        CREATE UNIQUE INDEX legacy_public_id ON objects(legacy_id) WHERE legacy_id IS NOT NULL;
+        CREATE INDEX object_parent_key ON objects(parent_key) WHERE missing=0;
+        CREATE INDEX object_native ON objects(native_volume,native_ref) WHERE missing=0 AND native_ref IS NOT NULL;")?;
+    if let Some(sequence) = sequence {
+        db.execute(
+            "UPDATE sqlite_sequence SET seq=max(seq,?1) WHERE name='objects'",
+            [sequence],
+        )?;
+        db.execute(
+            "INSERT INTO sqlite_sequence(name,seq) SELECT 'objects',?1 WHERE NOT EXISTS(
+            SELECT 1 FROM sqlite_sequence WHERE name='objects')",
+            [sequence],
+        )?;
+    }
+    for statement in object_schema {
+        if [
+            "CREATE INDEX object_native ",
+            "CREATE INDEX object_size ",
+            "CREATE INDEX object_parent ",
+        ]
+        .iter()
+        .all(|prefix| !statement.starts_with(prefix))
+        {
+            db.execute_batch(
+                &statement
+                    .replace("id<>NEW.id", "key<>NEW.key")
+                    .replace("id<>OLD.id", "key<>OLD.key"),
+            )?;
+        }
+    }
+    let violations: i64 =
+        db.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+            r.get(0)
+        })?;
+    ensure!(
+        violations == 0,
+        "lean Ledger migration found {violations} foreign key violations"
+    );
+    Ok(())
 }
 
 pub(crate) fn consolidate_keys(db: &Connection) -> Result<()> {

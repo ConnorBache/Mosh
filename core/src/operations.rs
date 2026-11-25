@@ -359,6 +359,10 @@ impl Mosh {
                             "{source}: select ordinary files for this operation"
                         ));
                     } else if let Err(error) = parent_safe(path, &roots).and_then(|_| {
+                        ensure!(
+                            fsmeta::matches_indexed(&item, path),
+                            "file changed since indexing: {source}"
+                        );
                         original_matches(
                             &Entry {
                                 object: item.id.clone(),
@@ -462,7 +466,10 @@ impl Mosh {
         let mut manifest: Manifest = serde_json::from_str(&manifest)?;
         for entry in &mut manifest.entries {
             if let Some(id) = crate::lean::resolve(&self.db, &entry.object)? {
-                entry.object = id;
+                entry.object = self
+                    .db
+                    .prepare_cached("SELECT id FROM objects WHERE key=?")?
+                    .query_row([id], |row| row.get(0))?;
             }
         }
         Ok((manifest, state))
@@ -561,7 +568,10 @@ impl Mosh {
                 [&plan.argument],
                 |row| row.get(0),
             )?;
-            tx.execute("INSERT INTO owners VALUES(?,?)", params![id, self.actor])?;
+            tx.execute(
+                "INSERT INTO owners VALUES(mosh_key(?),?)",
+                params![id, self.actor],
+            )?;
             collection = Some(id);
         }
         for (index, entry) in plan.entries.iter().enumerate() {
@@ -577,7 +587,7 @@ impl Mosh {
                 continue;
             } else if let Some(collection) = &collection {
                 tx.execute(
-                    "INSERT INTO edges(container,target,kind) VALUES(?,?,'reference')",
+                    "INSERT INTO edges(container,target,kind) VALUES(mosh_key(?),mosh_key(?),'reference')",
                     params![collection, item.id],
                 )?;
             }
@@ -720,7 +730,7 @@ impl Mosh {
         // stronger evidence than the birth-time check used for an external rename.
         ensure!(
             self.db.execute(
-                "UPDATE objects SET path_literal=?,path_folder=NULL,created=?,missing=0 WHERE id=?",
+                "UPDATE objects SET path_literal=?,path_folder=NULL,created=?,missing=0 WHERE key=mosh_key(?)",
                 params![path_text(path)?, created, entry.object]
             )? == 1,
             "could not reconnect the file to its Ledger identity"

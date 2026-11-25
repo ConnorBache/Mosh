@@ -122,6 +122,10 @@ fn v1_migration_preserves_provenance_aliases_and_search_across_vacuum() -> Resul
             ('old-id','file',?,'original.txt','txt','a stale copy of the original')",
             [stored.to_str().unwrap()],
         )?;
+        db.execute(
+            "INSERT INTO objects(id,kind,name) VALUES('untagged','file','untagged')",
+            [],
+        )?;
         db.execute_batch("INSERT INTO tag_dictionary VALUES(1,'topic'),(2,'candidate'),(3,'subject');
             INSERT INTO tag_aliases VALUES('topic-alias',1);
             INSERT INTO tag_assignments VALUES
@@ -130,6 +134,11 @@ fn v1_migration_preserves_provenance_aliases_and_search_across_vacuum() -> Resul
             INSERT INTO paint VALUES('old-id','standard','A useful note',1,1,'user');")?;
     }
     let mosh = Mosh::open(&database)?;
+    assert!(
+        mosh.tags("untagged")?
+            .iter()
+            .any(|tag| tag["name"] == "file")
+    );
     let check = |query| {
         mosh.search(query, &SearchOptions::default())
             .map(|found| found.len())
@@ -198,35 +207,22 @@ fn v1_migration_preserves_provenance_aliases_and_search_across_vacuum() -> Resul
 }
 
 #[test]
-fn bounded_content_cache_falls_back_to_live_text_and_invalidates_on_scan() -> Result<()> {
+fn content_uses_current_source_without_a_persistent_text_index() -> Result<()> {
     let fixture = Fixture::new()?;
     let file = fixture.root.join("report.md");
     fs::write(&file, "Résumé on lunar navigation")?;
     fixture.scan()?;
-    assert_eq!(fixture.mosh.text_status()?["cached_files"], 0);
     assert_eq!(fixture.search(r#"content:"resume on""#)?, ["report.md"]);
-    let stop = AtomicBool::new(false);
-    let too_small = fixture.mosh.index_text(1, &stop)?;
-    assert_eq!(too_small["cached_files"], 0);
-    assert_eq!(too_small["budget_reached"], true);
-    let built = fixture.mosh.index_text(128 * 1024, &stop)?;
-    assert_eq!(built["cached_files"], 1);
-    assert!(built["cache_bytes"].as_i64().unwrap() <= 128 * 1024);
     assert_eq!(
         fixture.search(r#"content:"lunar navigation""#)?,
         ["report.md"]
     );
-    assert_eq!(
-        rusqlite::Connection::open(&fixture.db)?.query_row(
-            "SELECT body IS NULL FROM text_terms",
-            [],
-            |r| r.get::<_, bool>(0)
-        )?,
-        true
-    );
+    let connection = rusqlite::Connection::open(&fixture.db)?;
+    assert_eq!(connection.query_row(
+        "SELECT count(*) FROM sqlite_schema WHERE name IN ('ledger','directory_fts','text_terms','text_cached')",
+        [], |row| row.get::<_, i64>(0)
+    )?, 0);
     fs::write(&file, "Replacement from another revision")?;
-    fixture.scan()?;
-    assert_eq!(fixture.mosh.text_status()?["cached_files"], 0);
     assert_eq!(fixture.search("content:replacement")?, ["report.md"]);
     assert!(fixture.search("content:lunar")?.is_empty());
     assert!(
@@ -235,7 +231,6 @@ fn bounded_content_cache_falls_back_to_live_text_and_invalidates_on_scan() -> Re
             .preview(file.to_str().unwrap())?
             .contains("another revision")
     );
-    assert_eq!(fixture.mosh.index_text(0, &stop)?["budget_bytes"], 0);
     Ok(())
 }
 
@@ -295,7 +290,7 @@ fn cleave_tag_records_one_packed_membership_event() -> Result<()> {
 }
 
 #[test]
-fn directory_search_shares_postings_and_matches_relative_phrases() -> Result<()> {
+fn live_directory_search_uses_relative_phrases_and_permissions() -> Result<()> {
     let fixture = Fixture::new()?;
     let root = fixture.root.join("machineancestor").join("projectroot");
     let src = root.join("src");
@@ -329,10 +324,16 @@ fn directory_search_shares_postings_and_matches_relative_phrases() -> Result<()>
     assert!(fixture.search("kind:file text:machineancestor")?.is_empty());
     assert!(fixture.search("kind:file text:projectroot")?.is_empty());
 
-    let count = fixture.mosh.doctor()?["directory_documents"].clone();
+    let raw = rusqlite::Connection::open(&fixture.db)?;
+    let directory_count = || {
+        raw.query_row("SELECT count(*) FROM path_folders", [], |row| {
+            row.get::<_, i64>(0)
+        })
+    };
+    let count = directory_count()?;
     fs::write(parser.join("old-léxer.bin"), [0u8])?;
     assert_eq!(fixture.mosh.scan(&root, &cancel)?.errors, 0);
-    assert_eq!(fixture.mosh.doctor()?["directory_documents"], count);
+    assert_eq!(directory_count()?, count);
 
     let restricted = fixture.mosh.get(parser.to_str().unwrap())?;
     fixture.mosh.person("guest", None)?;
@@ -664,22 +665,50 @@ fn records_authentic_windows_file_metadata() -> Result<()> {
     assert_eq!(fixture.search("allocated:>=0 ext:txt")?, ["win.txt"]);
     assert_eq!(fixture.search("mime:text/plain")?, ["win.txt"]);
     let raw = rusqlite::Connection::open(&fixture.db)?;
-    let stored: (String, i64, bool) = raw.query_row(
-        "SELECT typeof(native_id), length(native_id),
-            path_folder IS NOT NULL AND path_literal IS NULL AND mime IS NULL
-            FROM objects WHERE id=?",
-        [&object.id],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    let stored: (String, i64, bool, i64) = raw.query_row(
+        "SELECT typeof(native_ref), length(native_ref),
+            path_folder IS NOT NULL AND path_literal IS NULL AND mime IS NULL,
+            native_volume FROM objects WHERE name='win.txt'",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
     )?;
     assert_eq!(stored.0, "blob");
-    assert!(matches!(stored.1, 16 | 24));
+    assert!((1..=16).contains(&stored.1));
     assert!(stored.2);
+    assert!(stored.3 > 0);
     let stored_live_fields: i64 = raw.query_row(
         "SELECT count(*) FROM pragma_table_xinfo('objects') WHERE hidden=0
-         AND name IN ('path','extension','allocated','accessed','attributes','volume','filesystem','hardlinks')",
+         AND name IN ('path','extension','allocated','accessed','attributes','volume','filesystem','hardlinks','size','modified','changed','native_id','id')",
         [], |row| row.get(0),
     )?;
     assert_eq!(stored_live_fields, 0);
     assert!(fixture.mosh.history(Some(&object.id), 20)?.is_empty());
+    Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+fn resolves_an_external_rename_by_native_id_with_destination_permissions() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let original = fixture.root.join("original.txt");
+    let restricted = fixture.root.join("restricted");
+    fs::create_dir(&restricted)?;
+    fs::write(&original, "a unique file on disk")?;
+    fixture.scan()?;
+    let id = fixture.mosh.get(original.to_str().unwrap())?.id;
+    fixture.mosh.tag(&id, "keep-my-tag", true, 1.0)?;
+    fixture.mosh.person("visitor", None)?;
+    fixture.mosh.secret(restricted.to_str().unwrap(), true)?;
+    let visitor = Mosh::as_actor(&fixture.db, "visitor")?;
+    let destination = restricted.join("moved.txt");
+    fs::rename(&original, &destination)?;
+    let recovered = fixture.mosh.get(&id)?;
+    assert_eq!(recovered.path.as_deref(), destination.to_str());
+    assert_eq!(fixture.mosh.preview(&id)?, "a unique file on disk");
+    assert_ne!(visitor.get(&id)?.path.as_deref(), destination.to_str());
+    assert!(visitor.preview(&id)?.is_empty());
+    fixture.scan()?;
+    assert!(visitor.get(&id).is_err());
+    assert_eq!(fixture.search("direct-tag:keep-my-tag")?, ["moved.txt"]);
     Ok(())
 }

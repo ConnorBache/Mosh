@@ -145,7 +145,6 @@ fn discover_only_cannot_reveal_private_tags_paint_or_source() -> Result<()> {
             .iter()
             .all(|item| item["name"] != "privateterm")
     );
-    f.mosh.index_text(100_000, &AtomicBool::new(false))?;
     for query in ["content:bluepassage", "paint:bluepaint", "tag:privateterm"] {
         assert_eq!(f.mosh.search(query, &SearchOptions::default())?.len(), 1);
         assert!(

@@ -17,12 +17,24 @@ impl Mosh {
     pub fn preview(&self, reference: &str) -> Result<String> {
         let item = self.find(reference)?;
         self.require_contents(&item)?;
-        Ok(crate::content::preview(&item))
+        let text = crate::content::preview(&item);
+        #[cfg(windows)]
+        if text.is_empty() {
+            let mut item = item;
+            if self.recover_windows_path(&mut item, "content")? {
+                return Ok(crate::content::preview(&item));
+            }
+        }
+        Ok(text)
     }
 
     pub fn open_in_system(&self, reference: &str) -> Result<()> {
         self.admin()?;
-        let item = self.find(reference)?;
+        let mut item = self.get(reference)?;
+        ensure!(
+            fsmeta::populate_basic(&mut item),
+            "the indexed file is no longer at its recorded location"
+        );
         let path = Path::new(
             item.path
                 .as_deref()

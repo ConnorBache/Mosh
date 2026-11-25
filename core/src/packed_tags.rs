@@ -469,7 +469,7 @@ fn default_evidence(origin: u8) -> Option<&'static str> {
 
 fn key(db: &Connection, object: &str) -> Result<i64> {
     Ok(db
-        .prepare_cached("SELECT key FROM object_keys WHERE object=?")?
+        .prepare_cached("SELECT mosh_key(?)")?
         .query_row([object], |r| r.get(0))?)
 }
 
@@ -672,6 +672,17 @@ impl<'a> Writer<'a> {
         value: Option<(f64, Option<&str>)>,
     ) -> Result<i64> {
         let object = key(self.db, object)?;
+        self.assign_key(object, tag, origin, value)?;
+        Ok(object)
+    }
+
+    pub(crate) fn assign_key(
+        &mut self,
+        object: i64,
+        tag: i64,
+        origin: u8,
+        value: Option<(f64, Option<&str>)>,
+    ) -> Result<()> {
         let (id, old) = read_set(self.db, object)?;
         let mut tags = old.clone();
         if let Some((confidence, evidence)) = value {
@@ -695,12 +706,10 @@ impl<'a> Writer<'a> {
         if value.is_none() {
             require_file_tag(self.db, object, &tags)?;
         }
-        self.replace(object, id, &old, &tags)?;
-        Ok(object)
+        self.replace(object, id, &old, &tags)
     }
 
-    pub fn filesystem(&mut self, object: &str, ids: &[i64]) -> Result<()> {
-        let object = key(self.db, object)?;
+    pub fn filesystem(&mut self, object: i64, ids: &[i64]) -> Result<()> {
         let (id, old) = read_set(self.db, object)?;
         let mut tags = old.clone();
         tags.retain(|_, bits| {
@@ -716,8 +725,7 @@ impl<'a> Writer<'a> {
         self.replace(object, id, &old, &tags)
     }
 
-    pub fn invalidate_enrichment(&mut self, object: &str, previous_revision: i64) -> Result<()> {
-        let key = key(self.db, object)?;
+    pub fn invalidate_enrichment(&mut self, key: i64, previous_revision: i64) -> Result<()> {
         let (id, old) = read_set(self.db, key)?;
         let mut tags = old.clone();
         tags.retain(|_, mask| {

@@ -38,12 +38,11 @@ fn within_excluded_path(path: &str, directory: &str) -> bool {
     }
 }
 
-pub(crate) fn index_changed(db: &Connection, id: &str, revision: i64) -> Result<()> {
+pub(crate) fn index_changed(db: &Connection, key: i64, revision: i64) -> Result<()> {
     let cfg = models::config(db)?;
     if cfg.mode == "off" || (cfg.classification.is_empty() && cfg.embedding.is_empty()) {
         return Ok(());
     }
-    let key = tiers::key(db, id)?;
     db.prepare_cached("INSERT OR IGNORE INTO ai_jobs(kind,object_key,revision,priority,queued)
         VALUES('enrich',?,?,coalesce((SELECT target*10+predicted_hotness FROM file_tiers WHERE object_key=?1),0),?)")?
         .execute(params![key,revision,now()])?;
@@ -265,7 +264,7 @@ impl Mosh {
         let automatic = if query.trim().is_empty() {
             let term = name.split_once(':').map_or(name.as_str(), |(_, name)| name);
             let common = lexical(term);
-            let text = format!("indexed-content:{}", query_value(&term.replace('-', " "))?);
+            let text = format!("content:{}", query_value(&term.replace('-', " "))?);
             if common.is_empty() {
                 text
             } else {
@@ -345,7 +344,7 @@ impl Mosh {
     fn policy(&self, object: &Object, cfg: &Config) -> Result<(Config, bool)> {
         let path = object.path.as_deref();
         let mut cfg = cfg.clone();
-        let mut statement=self.db.prepare("SELECT p.mode,p.remote,o.secret FROM objects o JOIN object_keys k ON k.object=o.id
+        let mut statement=self.db.prepare("SELECT p.mode,p.remote,o.secret FROM objects o JOIN object_keys k ON k.key=o.key
             LEFT JOIN coll_ai_policy p ON p.object_key=k.key WHERE (p.object_key IS NOT NULL OR o.secret=1) AND o.missing=0 AND
             (o.id=?1 OR (o.path IS NOT NULL AND ?2 IS NOT NULL AND substr(?2,1,length(rtrim(o.path,?3))+1)=rtrim(o.path,?3)||?3))
             ORDER BY length(o.path) DESC")?;
@@ -762,7 +761,7 @@ impl Mosh {
             tier_policy.as_ref().and_then(|p| p.paint.as_deref())
         };
         if let (Some(level), Some(paint)) = (paint_level, paint) {
-            tx.execute("INSERT INTO paint VALUES(?,?,?,?,0,'ai') ON CONFLICT DO UPDATE SET level=excluded.level,body=excluded.body,
+            tx.execute("INSERT INTO paint VALUES(mosh_key(?),?,?,?,0,'ai') ON CONFLICT DO UPDATE SET level=excluded.level,body=excluded.body,
                 revision=excluded.revision,origin=excluded.origin WHERE locked=0",
                 params![item.id,level,paint,item.revision])?;
         }
@@ -953,9 +952,7 @@ impl Branch {
         }
         if let Some(text) = &self.text {
             let text = query_value(text)?;
-            terms.push(format!(
-                "(name-contains:{text} OR paint:{text} OR indexed-content:{text})"
-            ));
+            terms.push(format!("(name-contains:{text} OR paint:{text} )"));
         }
         let query = terms.join(" AND ");
         crate::query::validate(&query)?;
@@ -1150,7 +1147,7 @@ impl Mosh {
         let readable = crate::security::allowed("content");
         let authority = organization::AUTHORITY;
         let mut stmt=self.db.prepare(&format!("{authority} SELECT o.id,e.vector FROM embeddings e JOIN object_keys k ON k.key=e.object_key
-            JOIN objects o ON o.id=k.object WHERE e.model=?3 AND e.revision=o.revision AND o.missing=0 AND {visible} AND {readable}"))?;
+            JOIN objects o ON o.key=k.key WHERE e.model=?3 AND e.revision=o.revision AND o.missing=0 AND {visible} AND {readable}"))?;
         let mut rows = stmt.query(params![
             self.actor,
             std::path::MAIN_SEPARATOR_STR,
@@ -1185,7 +1182,7 @@ impl Mosh {
         let readable = crate::security::allowed("content");
         let order = if plan.original { "ASC" } else { "DESC" };
         let mut statement=self.db.prepare(&format!("{authority}
-            SELECT o.id,p.id FROM passages p JOIN object_keys k ON p.object_key=k.key JOIN objects o ON k.object=o.id
+            SELECT o.id,p.id FROM passages p JOIN object_keys k ON p.object_key=k.key JOIN objects o ON k.key=o.key
             WHERE o.missing=0 AND o.revision=p.revision AND {visible} AND {readable}
               AND (?3=0 OR p.kind='assignment') AND (?10=0 OR p.kind='deadline') AND (?4 IS NULL OR p.actor=?4)
               AND (?5 IS NULL OR p.recipient=?5) AND (?6 IS NULL OR instr(p.topic,?6)>0)
@@ -1372,10 +1369,7 @@ impl Mosh {
                 && candidates.len() < cfg.max_candidates
                 && let Some(topic) = &plan.topic
             {
-                let query = require_tags(
-                    format!("indexed-content:{}", query_value(topic)?),
-                    &required,
-                );
+                let query = require_tags(format!("content:{}", query_value(topic)?), &required);
                 for item in self.search(
                     &query,
                     &SearchOptions {
@@ -1385,7 +1379,7 @@ impl Mosh {
                 )? {
                     let entry = candidates.entry(item.id).or_default();
                     entry.0 += 8;
-                    entry.1.insert("indexed source text".into());
+                    entry.1.insert("live source text".into());
                 }
             }
         }
@@ -1619,7 +1613,7 @@ impl Mosh {
             "source or worker changed"
         );
         let mut reference = tx.prepare("SELECT r.id,r.request,r.plan,r.result,o.id FROM retrieval_feedback f
-            JOIN retrievals r ON r.id=f.run JOIN object_keys k ON k.key=f.object_key JOIN objects o ON o.id=k.object
+            JOIN retrievals r ON r.id=f.run JOIN object_keys k ON k.key=f.object_key JOIN objects o ON o.key=k.key
             WHERE r.actor='local' AND r.id<>?1 AND f.helpful=1 AND o.missing=0
             ORDER BY (f.object_key=?2) DESC,r.id DESC LIMIT 12")?;
         let previous = reference
@@ -1645,13 +1639,12 @@ impl Mosh {
             let before = replay(&request, &plan)?;
             let rank = get_rank(&before, &file);
             let prior_ids: Vec<String> = serde_json::from_str(&recorded)?;
+            let file_key = crate::lean::resolve(&self.db, &file)?;
             let had_result = prior_ids.iter().any(|old| {
                 old == &file
-                    || crate::lean::resolve(&self.db, old)
-                        .ok()
-                        .flatten()
-                        .as_deref()
-                        == Some(file.as_str())
+                    || file_key.is_some_and(|key| {
+                        crate::lean::resolve(&self.db, old).ok().flatten() == Some(key)
+                    })
             });
             cases.push((
                 id,

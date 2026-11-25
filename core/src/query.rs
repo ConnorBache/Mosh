@@ -252,27 +252,25 @@ impl Parser {
                 let id = self.bind(tag_name(value)?);
                 let suggested = u8::from(field == "suggested-tag");
                 let readable = crate::security::allowed("paint");
-                let direct = format!("SELECT k.object FROM tag_blocks b JOIN json_each(mosh_block_slots(b.packed)) p
+                let direct = format!("SELECT k.key FROM tag_blocks b JOIN json_each(mosh_block_slots(b.packed)) p
                     JOIN object_keys k ON k.key=b.block*4096+p.value WHERE b.suggested={suggested}
                     AND b.tag IN(SELECT id FROM tag_dictionary WHERE name={id} UNION SELECT tag FROM tag_aliases WHERE alias={id})");
                 if matches!(field, "tag" | "inherited-tag") {
                     let selection = if field == "tag" {
                         "SELECT id FROM matched"
                     } else {
-                        "SELECT o2.id FROM objects o2 JOIN matched m2 ON o2.parent=m2.id WHERE o2.missing=0"
+                        "SELECT o2.key FROM objects o2 JOIN matched m2 ON o2.parent_key=m2.id WHERE o2.missing=0"
                     };
-                    format!("({readable} AND o.id IN(WITH RECURSIVE matched(id) AS ({direct}
-                        UNION SELECT child.id FROM objects child JOIN matched m ON child.parent=m.id WHERE child.missing=0)
+                    format!("({readable} AND o.key IN(WITH RECURSIVE matched(id) AS ({direct}
+                        UNION SELECT child.key FROM objects child JOIN matched m ON child.parent_key=m.id WHERE child.missing=0)
                         {selection}))")
                 } else {
-                    format!("({readable} AND o.id IN({direct}))")
+                    format!("({readable} AND o.key IN({direct}))")
                 }
             }
             "id" => {
                 let id = self.bind(value.to_owned());
-                format!(
-                    "(o.id={id} OR o.id=(SELECT object FROM legacy_object_ids WHERE alias=mosh_legacy_id({id})))"
-                )
+                format!("o.key=mosh_key({id})")
             }
             "name" => format!("o.name={} COLLATE NOCASE", self.bind(value.to_owned())),
             "name-contains" => format!(
@@ -335,19 +333,24 @@ impl Parser {
                 } else {
                     field
                 };
+                let field_sql = if field == "git-age" {
+                    "o.git_committed".to_owned()
+                } else {
+                    visible_stat(column)
+                };
                 let (op, value) = comparison(value);
                 let op = if age(value).is_some() { flip(op) } else { op };
                 if let Some((start, end)) = value.split_once("..") {
                     let start = self.bind(date(start)?);
                     let end = self.bind(date(end)?);
-                    format!("o.{column} BETWEEN {start} AND {end}")
+                    format!("{field_sql} BETWEEN {start} AND {end}")
                 } else {
-                    format!("o.{column}{op}{}", self.bind(date(value)?))
+                    format!("{field_sql}{op}{}", self.bind(date(value)?))
                 }
             }
             "size" => {
                 let (op, value) = comparison(value);
-                format!("o.size{op}{}", self.bind(bytes(value)?))
+                format!("{}{op}{}", visible_stat("size"), self.bind(bytes(value)?))
             }
             "allocated" => {
                 let (op, value) = comparison(value);
@@ -363,7 +366,7 @@ impl Parser {
                 );
                 let members = format!("o.hash IS NOT NULL AND EXISTS(SELECT 1 FROM objects d WHERE d.hash=o.hash
                     AND d.missing=0 AND d.id<>o.id AND (o.native_id IS NULL OR d.native_id IS NOT o.native_id)
-                    AND {})",VISIBLE.replace("o.id","d.id").replace("o.path","d.path"));
+                    AND {})",VISIBLE.replace("o.key","d.key").replace("o.path","d.path"));
                 if value == "true" {
                     format!("({members})")
                 } else {
@@ -385,14 +388,15 @@ impl Parser {
                 self.bind(value.to_owned())
             ),
             "owner" => format!(
-                "o.id IN(SELECT object FROM owners WHERE person={})",
+                "o.key IN(SELECT object FROM owners WHERE person={})",
                 self.bind(value.to_owned())
             ),
             "marriage" | "logical-parent" => {
                 let collection = format!(
-                    "SELECT c.id FROM objects c WHERE c.missing=0 AND (c.id=?VALUE OR c.name=?VALUE COLLATE NOCASE
-                     OR c.id=(SELECT object FROM legacy_object_ids WHERE alias=mosh_legacy_id(?VALUE))) AND {}",
-                    VISIBLE.replace("o.id", "c.id").replace("o.path", "c.path")
+                    "SELECT c.key FROM objects c WHERE c.missing=0 AND (c.key=mosh_key(?VALUE) OR c.name=?VALUE COLLATE NOCASE) AND {}",
+                    VISIBLE
+                        .replace("o.key", "c.key")
+                        .replace("o.path", "c.path")
                 );
                 let collection = collection.replace("?VALUE", &self.bind(value.to_owned()));
                 let kind = if field == "marriage" {
@@ -401,98 +405,45 @@ impl Parser {
                     "parent"
                 };
                 format!(
-                    "o.id IN(SELECT target FROM edges WHERE kind='{kind}' AND container IN({collection}))"
+                    "o.key IN(SELECT target FROM edges WHERE kind='{kind}' AND container IN({collection}))"
                 )
             }
-            "indexed-content" => {
-                let term = self.bind(format!("\"{}\"", value.replace('"', "\"\"")));
-                let readable = crate::security::allowed("content");
-                format!("({readable} AND o.id IN(SELECT k.object FROM text_terms JOIN object_keys k ON k.key=text_terms.rowid
-                    WHERE text_terms MATCH {term}))")
-            }
-            "content" | "paint" | "text" | "" => {
-                let phrase = crate::metadata_search::phrase(value);
+            "indexed-content" | "content" | "paint" | "text" | "" => {
+                let term = self.bind(value.to_owned());
                 let mut clauses = Vec::new();
-                if field != "content" {
-                    if field != "paint" {
-                        clauses.extend(self.metadata_matches(value, &phrase));
-                    }
-                    let fts = self.bind(format!("paint:{phrase}"));
-                    let readable = crate::security::allowed("paint");
-                    clauses.push(format!("({readable} AND o.id IN(SELECT k.object FROM ledger JOIN object_keys k ON k.key=ledger.rowid WHERE ledger MATCH {fts}))"));
+                if matches!(field, "" | "text") {
+                    clauses.push(format!("mosh_metadata_match(o.name,{term})"));
+                    clauses.push(format!("mosh_metadata_match(
+                        CASE WHEN o.path_folder IS NOT NULL THEN (
+                            SELECT relative||'/'||o.name FROM path_folder_search WHERE id=o.path_folder
+                        ) ELSE (
+                            SELECT mosh_search_relative(o.path_literal,r.path) FROM roots r
+                            WHERE mosh_search_relative(o.path_literal,r.path) IS NOT NULL
+                            ORDER BY length(r.path) DESC,r.path LIMIT 1
+                        ) END,{term})"));
                 }
-                if field.is_empty() {
+                if matches!(field, "" | "text" | "paint") {
+                    let readable = crate::security::allowed("paint");
                     clauses.push(format!(
-                        "instr(lower(o.name),lower({}))>0",
-                        self.bind(value.to_owned())
+                        "CASE WHEN {VISIBLE} AND {readable} THEN mosh_metadata_match(
+                        (SELECT body FROM paint WHERE object=o.key),{term}) ELSE 0 END"
                     ));
                 }
+                if field.is_empty() {
+                    clauses.push(format!("instr(lower(o.name),lower({term}))>0"));
+                }
                 if field != "paint" {
-                    let term = self.bind(phrase);
                     let readable = crate::security::allowed("content");
-                    clauses.push(format!("({readable} AND o.id IN(SELECT k.object FROM text_terms JOIN object_keys k ON k.key=text_terms.rowid
-                        WHERE text_terms MATCH {term}))"));
-                    clauses.push(format!("CASE WHEN o.missing=0 AND o.kind='file' AND o.reparse=0 AND o.path IS NOT NULL
-                        AND mosh_text_supported(o.extension) AND {VISIBLE} AND {readable} AND NOT EXISTS(
-                            SELECT 1 FROM object_keys k JOIN text_cached c ON c.key=k.key WHERE k.object=o.id
-                        ) THEN mosh_live_match(o.path,o.extension,o.native_id,o.created,{term}) ELSE 0 END"));
+                    clauses.push(format!("CASE WHEN o.missing=0 AND o.kind='file' AND o.reparse=0
+                        AND mosh_text_supported(o.extension) AND {VISIBLE} AND {readable}
+                        AND o.path IS NOT NULL
+                        THEN mosh_live_match(o.path,o.extension,o.native_id,o.created,{term}) ELSE 0 END"));
                 }
                 format!("({})", clauses.join(" OR "))
             }
             _ => bail!("unknown search field {field}"),
         };
         Ok(clause)
-    }
-
-    fn metadata_matches(&mut self, value: &str, phrase: &str) -> Vec<String> {
-        let full = self.bind(phrase.to_owned());
-        let mut clauses = vec![
-            format!(
-                "o.id IN(SELECT k.object FROM ledger JOIN object_keys k ON k.key=ledger.rowid
-               WHERE ledger MATCH ('name:'||{full}))"
-            ),
-            format!(
-                "o.path_folder IN(SELECT rowid FROM directory_fts WHERE directory_fts MATCH {full})"
-            ),
-            format!(
-                "(o.kind_code=1 AND mosh_directory_prefix(o.path_literal) IN(
-                SELECT f.prefix FROM directory_fts JOIN path_folders f ON f.id=directory_fts.rowid
-                WHERE directory_fts MATCH {full}))"
-            ),
-            // Folders without direct file members already have a Coll. Rare imported file paths
-            // may also be literal. Evaluate those paths without allocating extra dictionary rows.
-            format!(
-                "CASE WHEN o.path_literal IS NOT NULL AND (o.kind_code=0 OR (o.kind_code=1 AND
-                    NOT EXISTS(SELECT 1 FROM path_folders WHERE prefix=mosh_directory_prefix(o.path_literal)))) THEN
-                mosh_metadata_match((SELECT mosh_search_relative(o.path_literal,r.path) FROM roots r
-                    WHERE mosh_search_relative(o.path_literal,r.path) IS NOT NULL
-                    ORDER BY length(r.path) DESC,r.path LIMIT 1),'',{full}) ELSE 0 END"
-            ),
-        ];
-        if !value.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
-            let raw = self.bind(value.to_owned());
-            clauses.push(format!("o.id IN(WITH splits AS MATERIALIZED (
-                SELECT key part,json_extract(value,'$[0]') head,json_extract(value,'$[1]') tail
-                FROM json_each(mosh_metadata_splits({raw}))
-              ), folders AS MATERIALIZED (
-                SELECT s.part,f.id FROM splits s CROSS JOIN directory_fts
-                JOIN path_folder_search f ON f.id=directory_fts.rowid
-                WHERE directory_fts MATCH ('\"'||s.head||'\"') AND mosh_metadata_suffix(f.relative,s.head)
-              ), names AS MATERIALIZED (
-                SELECT s.part,k.object,m.path_folder FROM splits s CROSS JOIN ledger
-                JOIN object_keys k ON k.key=ledger.rowid JOIN objects m ON m.id=k.object
-                WHERE ledger MATCH ('name:^'||s.tail) AND m.path_folder IS NOT NULL
-              ) SELECT n.object FROM names n JOIN folders f ON f.part=n.part AND f.id=n.path_folder)"));
-            // Verify an unusually long phrase directly to keep the list of indexed splits bounded.
-            clauses.push(format!("CASE WHEN mosh_metadata_splits({raw}) IS NULL AND
-                o.path_folder IN(SELECT rowid FROM directory_fts
-                WHERE directory_fts MATCH mosh_metadata_edge({raw},0)) AND o.id IN(
-                SELECT k.object FROM ledger JOIN object_keys k ON k.key=ledger.rowid
-                WHERE ledger MATCH ('name:'||mosh_metadata_edge({raw},1))) THEN
-                mosh_metadata_match((SELECT relative FROM path_folder_search WHERE id=o.path_folder),o.name,{full})
-                ELSE 0 END"));
-        }
-        clauses
     }
 }
 
@@ -514,11 +465,19 @@ fn direct_intersection(tags: &[String]) -> String {
         packed.push(format!("b{index}.packed"));
     }
     format!(
-        "({readable} AND o.id IN(SELECT k.object FROM tag_blocks b0 {joins}
+        "({readable} AND o.key IN(SELECT k.key FROM tag_blocks b0 {joins}
         JOIN json_each(mosh_common_slots({})) p JOIN object_keys k ON k.key=b0.block*4096+p.value
         WHERE b0.suggested=0 AND b0.tag IN({})))",
         packed.join(","),
         resolved(&tags[0])
+    )
+}
+
+fn visible_stat(field: &str) -> String {
+    let allowed = crate::security::allowed("paint");
+    format!(
+        "CASE WHEN {VISIBLE} AND {allowed}
+        THEN mosh_live_stat(o.path,o.native_id,o.created,o.reparse,'{field}') END"
     )
 }
 
@@ -624,25 +583,31 @@ pub(crate) fn validate(query: &str) -> Result<()> {
 impl Mosh {
     pub fn search(&self, query: &str, options: &SearchOptions) -> Result<Vec<Object>> {
         let (predicate, mut parser) = compile(query, &self.actor)?;
-        let order = match options.sort {
-            Sort::Name => "o.name COLLATE NOCASE,o.id",
-            Sort::NameDesc => "o.name COLLATE NOCASE DESC,o.id",
-            Sort::Modified => "o.modified DESC,o.id",
-            Sort::ModifiedAsc => "o.modified,o.id",
-            Sort::Size => "o.size DESC,o.id",
-            Sort::SizeAsc => "o.size,o.id",
-            Sort::Path => "o.path,o.id",
+        let (sort_value, desc) = match options.sort {
+            Sort::Name => ("o.name COLLATE NOCASE".to_owned(), ""),
+            Sort::NameDesc => ("o.name COLLATE NOCASE".to_owned(), "DESC"),
+            Sort::Modified => (visible_stat("modified"), "DESC"),
+            Sort::ModifiedAsc => (visible_stat("modified"), ""),
+            Sort::Size => (visible_stat("size"), "DESC"),
+            Sort::SizeAsc => (visible_stat("size"), ""),
+            Sort::Path => ("o.path".to_owned(), ""),
         };
+        let collate = if matches!(options.sort, Sort::Name | Sort::NameDesc) {
+            "COLLATE NOCASE"
+        } else {
+            ""
+        };
+        let order = format!("rank {collate} {desc},o.key");
         let mut scope = String::new();
         if let Some(parent) = &options.parent {
             let selected = self.find(parent)?;
-            let id = parser.bind(selected.id.clone());
+            let id = parser.bind(selected.key);
             scope = format!(
-                "AND (o.parent={id} OR o.id IN(SELECT target FROM edges WHERE container={id} AND kind<>'related')"
+                "AND (o.parent_key={id} OR o.key IN(SELECT target FROM edges WHERE container={id} AND kind<>'related')"
             );
             if selected.kind == "marriage" {
                 let mut statement = self.db.prepare("SELECT query FROM collection_queries WHERE container=? ORDER BY query LIMIT 40")?;
-                for expression in statement.query_map([&selected.id], |r| r.get::<_, String>(0))? {
+                for expression in statement.query_map([selected.key], |r| r.get::<_, String>(0))? {
                     let (predicate, dynamic) = compile(&expression?, &self.actor)?;
                     let start = parser.values.len();
                     let mapped = remap(&predicate, start);
@@ -656,14 +621,20 @@ impl Mosh {
         let offset = parser.bind(options.offset.min(i64::MAX as usize) as i64);
         // Filter and sort keys before decoding the complete file objects on this page.
         let sql = format!(
-            "{AUTHORITY}, selected(id) AS MATERIALIZED (
-                SELECT o.id FROM objects o WHERE o.missing=0 AND {VISIBLE}
+            "{AUTHORITY}, selected(key,rank) AS MATERIALIZED (
+                SELECT o.key,{sort_value} AS rank FROM objects o WHERE o.missing=0 AND {VISIBLE}
                 AND ({predicate}) {scope} ORDER BY {order} LIMIT {limit} OFFSET {offset}
-             ) SELECT o.* FROM selected s JOIN objects o ON o.id=s.id ORDER BY {order}"
+             ) SELECT o.* FROM selected s JOIN objects o ON o.key=s.key ORDER BY {order}"
         );
         let mut statement = self.db.prepare(&sql)?;
         let results = statement.query_map(params_from_iter(parser.values), object)?;
-        Ok(results.collect::<rusqlite::Result<_>>()?)
+        let mut results = results.collect::<rusqlite::Result<Vec<_>>>()?;
+        for result in &mut results {
+            if self.permits(result, "paint")? {
+                crate::fsmeta::populate_basic(result);
+            }
+        }
+        Ok(results)
     }
 }
 

@@ -60,9 +60,7 @@ struct SavedTier {
 }
 
 pub(crate) fn key(db: &Connection, id: &str) -> Result<i64> {
-    Ok(db
-        .prepare_cached("SELECT key FROM objects WHERE id=?")?
-        .query_row([id], |r| r.get(0))?)
+    crate::lean::resolve(db, id)?.context("unknown Ledger file key")
 }
 
 pub(crate) fn setting<T: for<'a> Deserialize<'a> + Default>(
@@ -282,13 +280,13 @@ pub(crate) fn assess(
     recompute(db, key, is_new)
 }
 
-pub(crate) fn indexed(db: &Connection, id: &str) -> Result<()> {
+pub(crate) fn indexed(db: &Connection, object_key: i64) -> Result<()> {
     let (key, revision, exceptional): (i64, i64, bool) = db
         .prepare_cached(
             "SELECT o.key,o.revision,EXISTS(SELECT 1 FROM file_tiers f WHERE f.object_key=o.key)
-        FROM objects o WHERE o.id=?",
+        FROM objects o WHERE o.key=?",
         )?
-        .query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        .query_row([object_key], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
     if exceptional {
         let (path, extension): (String, String) = db
             .prepare_cached(
@@ -305,7 +303,7 @@ pub(crate) fn indexed(db: &Connection, id: &str) -> Result<()> {
         )?;
         prune_default(db, key)?;
     }
-    crate::intelligence::index_changed(db, id, revision)?;
+    crate::intelligence::index_changed(db, key, revision)?;
     Ok(())
 }
 
@@ -328,17 +326,17 @@ fn save_default(db: &Connection, object: &Object, key: i64) -> Result<()> {
 }
 
 pub(crate) fn ensure_minimum(db: &Connection) -> Result<()> {
-    let mut statement=db.prepare("SELECT o.id FROM objects o JOIN object_keys k ON k.object=o.id LEFT JOIN tag_sets s ON s.id=k.tag_set
+    let mut statement=db.prepare("SELECT k.key FROM objects o JOIN object_keys k ON k.object=o.id LEFT JOIN tag_sets s ON s.id=k.tag_set
         WHERE o.kind='file' AND coalesce(s.confirmed,0)=0")?;
     let rows = statement
-        .query_map([], |r| r.get::<_, String>(0))?
+        .query_map([], |r| r.get::<_, i64>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     if !rows.is_empty() {
         let id = crate::organization::dictionary_id(db, "file")?;
         let mut writer = packed_tags::Writer::new(db);
         for object in rows {
-            writer.assign(
-                &object,
+            writer.assign_key(
+                object,
                 id,
                 packed_tags::FILESYSTEM,
                 Some((1.0, Some("file metadata"))),
@@ -440,7 +438,7 @@ impl Mosh {
         if obj.kind != "file" {
             return Ok(Value::Null);
         }
-        let key = key(&self.db, &obj.id)?;
+        let key = obj.key;
         let saved=self.db.prepare_cached("SELECT f.importance,f.information,f.predicted_hotness,f.human_accesses,f.last_access,
             f.target,f.requested,f.locked,
             CASE f.assessor WHEN 'f' THEN 'filesystem' WHEN 'a' THEN 'ai' ELSE f.assessor END,
@@ -567,7 +565,7 @@ impl Mosh {
         self.editable(&obj)?;
         ensure!(obj.kind == "file", "tier reassessment applies to files");
         let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
-        indexed(&tx, &obj.id).context("assessing current file metadata")?;
+        indexed(&tx, obj.key).context("assessing current file metadata")?;
         tx.commit()?;
         self.file_tier_for(&obj)
     }
@@ -576,7 +574,7 @@ impl Mosh {
 #[cfg(test)]
 mod scale_test {
     use super::*;
-    use crate::SearchOptions;
+    use crate::{SearchOptions, lean};
     use std::{fs, time::Instant};
 
     #[test]
@@ -610,19 +608,9 @@ mod scale_test {
         let file = 1;
         let mut writer = packed_tags::Writer::new(&tx);
         for n in 1..=1_000_000 {
-            writer.assign(
-                &format!("file-{n:07}"),
-                file,
-                packed_tags::FILESYSTEM,
-                Some((1.0, None)),
-            )?;
+            writer.assign_key(n, file, packed_tags::FILESYSTEM, Some((1.0, None)))?;
         }
-        writer.assign(
-            "file-1000000",
-            2,
-            packed_tags::FILESYSTEM,
-            Some((1.0, None)),
-        )?;
+        writer.assign_key(1_000_000, 2, packed_tags::FILESYSTEM, Some((1.0, None)))?;
         writer.flush()?;
         tx.pragma_update(None, "user_version", 2)?;
         tx.commit()?;
@@ -630,10 +618,7 @@ mod scale_test {
         let baseline_time = baseline_started.elapsed();
         let baseline_bytes = fs::metadata(&path)?.len();
         let indexed = "direct-tag:file AND direct-tag:rare AND ext:txt";
-        let mut query = baseline.prepare(
-            "SELECT k.object FROM ledger JOIN object_keys k ON ledger.rowid=k.key
-            WHERE ledger MATCH 'name:file1000000'",
-        )?;
+        let mut query = baseline.prepare("SELECT id FROM objects WHERE id='file-1000000'")?;
         let start = Instant::now();
         for _ in 0..30 {
             let id: String = query.query_row([], |r| r.get(0))?;
@@ -655,13 +640,11 @@ mod scale_test {
             .db
             .query_row("SELECT count(*) FROM file_tiers", [], |r| r.get(0))?;
         assert_eq!(count, 0);
-        let mut query = ledger.db.prepare(
-            "SELECT k.object FROM ledger JOIN object_keys k ON ledger.rowid=k.key
-            WHERE ledger MATCH 'name:file1000000'",
-        )?;
+        let key = lean::resolve(&ledger.db, &current_id)?.context("missing key")?;
+        let mut query = ledger.db.prepare("SELECT id FROM objects WHERE key=?")?;
         let start = Instant::now();
         for _ in 0..30 {
-            let id: String = query.query_row([], |r| r.get(0))?;
+            let id: String = query.query_row([key], |r| r.get(0))?;
             assert_eq!(id, current_id);
         }
         let current_mean_ms = start.elapsed().as_secs_f64() * 1000.0 / 30.0;
@@ -676,7 +659,7 @@ mod scale_test {
         assert_eq!(result[0].id, current_id);
         let intersection_ms = intersect.elapsed().as_secs_f64() * 1000.0;
         println!(
-            "million metadata rows: base {baseline_time:.2?}, migration {migration_time:.2?}, bytes {baseline_bytes} -> {current_bytes}; warm FTS (30) {v2_mean_ms:.4} -> {current_mean_ms:.4} ms; two-tag intersection {intersection_ms:.2} ms"
+            "million metadata rows: base {baseline_time:.2?}, migration {migration_time:.2?}, bytes {baseline_bytes} -> {current_bytes}; warm ID lookup (30) {v2_mean_ms:.4} -> {current_mean_ms:.4} ms; two-tag intersection {intersection_ms:.2} ms"
         );
         Ok(())
     }

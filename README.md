@@ -6,7 +6,7 @@ Mosh is a local-first file explorer and searchable Ledger for Windows. It indexe
 
 Download the Windows x64 installer or CLI ZIP from [GitHub Releases](https://github.com/ConnorBache/Mosh/releases). The desktop application uses Microsoft Edge WebView2. The initial installer is unsigned. Compare its SHA-256 hash with the release checksum before running it.
 
-The published 0.2.0 preview uses Ledger format 8. Builds from this source tree use format 11 and upgrade earlier Ledgers on open. Back up your Ledger before upgrading. After upgrade, run `mosh ledger compact` to reclaim reusable pages. See the [preview release notes](docs/release-preview.md).
+The published 0.2.0 preview uses Ledger format 8. Builds from this source tree use format 12 and upgrade earlier Ledgers on open. Back up your Ledger before upgrading. After upgrade, run `mosh ledger compact` to reclaim reusable pages. See the [preview release notes](docs/release-preview.md).
 
 1. Open **Mosh** and choose **Index folder**. Select an ordinary directory.
 2. Browse the indexed folder. Double-click a folder to enter it or a file to open it with its Windows association. Select a row to inspect metadata, a text preview, tags, Paint, and available history.
@@ -60,23 +60,16 @@ Queries support uppercase `AND`, `OR`, and `NOT`, standalone parentheses, and an
 - `tag:planning` searches direct and inherited tags. `direct-tag:planning` and `inherited-tag:planning` distinguish the two.
 - `content:"release notes"` searches source text. `paint:handoff` searches Paint.
 - `modified:<30d` means an age under 30 days. Relative times support `h`, `d`, and `w`. Absolute values use UTC `YYYY-MM-DD` or RFC3339. Use `modified:2026-01-01..2026-02-01` for an inclusive range.
-- `size:>500MB`, `allocated:>=20MiB`, and `duplicate:true` filter by indexed size, allocation, or the last duplicate analysis.
+- `size:>500MB` and `allocated:>=20MiB` read current filesystem metadata. `duplicate:true` uses the last duplicate analysis.
 - `repo:Mosh`, `branch:main`, `git-status:modified`, and `git-author:"Example Author"` filter Git metadata. Author search covers the scan's recent first-parent history.
 
 ## Ledger storage
 
-The Ledger stores packed tag sets and reverse lookups. Identical tag sets share a single record. Search and previews read uncached file contents on demand, so broad content queries may take longer. Names, paths, and Paint stay searchable through the metadata index.
+Each indexed file has an integer key, a filename and shared directory reference, and a filesystem file ID qualified by a shared volume reference when available. A creation time guards identity where the OS provides it. An eight-byte change stamp detects edits between scans. Mosh reads current size and timestamps from the filesystem. On Windows, a lookup by Mosh ID can recover a renamed file using its native ID when the new location is in scope and permitted. Paths support portable lookup and distinguish hard links.
 
-~~~powershell
-.\mosh.exe ledger text-index --max-bytes 25000000
-.\mosh.exe ledger text-status
-.\mosh.exe ledger text-index --max-bytes 0
-.\mosh.exe ledger compact
-~~~
+The Ledger stores packed tag sets and reverse lookups. Identical tag sets share a single record. Search checks stored filenames, relative paths, and Paint directly. It reads source text on demand after applying scope and access checks. Broad content queries may take longer than scoped queries. Existing `indexed-content:` expressions resolve to live content search.
 
-The optional content cache stores searchable terms and positions up to the requested number of SQLite page bytes. It invalidates entries after Mosh observes file changes. Run the same command to rebuild it or pass zero to clear it. `doctor` reports the database size, reusable pages, tag storage, and cache sizes. The write-ahead log and temporary SQLite work files can use additional disk space during writes.
-
-Older Ledgers migrate on open. The migration keeps their tags, aliases, confidence, evidence, Paint, relationships, permissions, and history. Existing UUIDs resolve as aliases for compact IDs. Format 1's extracted-text cache is rebuilt on demand. Run `mosh ledger compact` to return reusable pages to the filesystem after an upgrade or cache clear. Inspect `mosh doctor` for per-table storage, reusable pages, and journal sizes.
+Older Ledgers migrate on open and retain their tags, aliases, confidence, evidence, Paint, relationships, permissions, and history. Existing UUIDs resolve as aliases for compact IDs. Migration drops rebuildable text indexes. Run `mosh ledger compact` to reclaim those pages. `mosh doctor` reports per-table page usage and reusable space. The write-ahead log and temporary SQLite work files can use additional disk space during writes.
 
 ## Individuality and vocabulary
 
