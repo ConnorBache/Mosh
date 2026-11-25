@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { ledger, type LedgerObject } from './ledger'
 
 type Fail = (error: unknown) => void
-type TierRule = { level: number; minimum_tags: number; minimum_score: number; passes: number; paint: string | null; embed: boolean }
+type TierRule = { level: number; minimum_individuality: number; minimum_score: number; passes: number; paint: string | null; embed: boolean }
 type TierSettings = { tiers: TierRule[]; weights: { importance: number; information: number; hotness: number; promote: boolean; demote: boolean; hysteresis: number } }
 type Config = Record<string, string | boolean | number | string[] | null>
 type Finding = { object: LedgerObject; why: string[]; excerpt: string | null; certainty: string; citation: { id: number } | null }
@@ -50,7 +50,7 @@ export function Settings({ fail }: { fail: Fail }) {
         </label>)}
       </div>
       {tiers.tiers.map(tier => <fieldset className="intel-grid" key={tier.level}><legend>T{tier.level}</legend>
-        <label>Minimum tags<input type="number" min="1" value={tier.minimum_tags} onChange={event => rule(tier.level, { minimum_tags: Number(event.target.value) })} /></label>
+        <label>Minimum Individuality<input type="number" min="0" max="100" value={tier.minimum_individuality} onChange={event => rule(tier.level, { minimum_individuality: Number(event.target.value) })} /></label>
         <label>Score threshold<input type="number" min="0" max="100" value={tier.minimum_score} onChange={event => rule(tier.level, { minimum_score: Number(event.target.value) })} /></label>
         <label>Analysis passes<input type="number" min="1" max="8" value={tier.passes} onChange={event => rule(tier.level, { passes: Number(event.target.value) })} /></label>
         <label>Paint<select value={tier.paint ?? ''} onChange={event => rule(tier.level, { paint: event.target.value || null })}>
@@ -62,7 +62,7 @@ export function Settings({ fail }: { fail: Fail }) {
         <button className="primary">Save tiers</button>
         {tiers.tiers.length < 10 && <button className="secondary" type="button" onClick={() => {
           const last = tiers.tiers[tiers.tiers.length - 1]
-          setTiers({ ...tiers, tiers: [...tiers.tiers, { ...last, level: last.level + 1, minimum_tags: last.minimum_tags + 1, minimum_score: Math.min(last.minimum_score + 1, 100) }] })
+          setTiers({ ...tiers, tiers: [...tiers.tiers, { ...last, level: last.level + 1, minimum_individuality: Math.min(last.minimum_individuality + 5, 100), minimum_score: Math.min(last.minimum_score + 1, 100) }] })
         }}>Configure T{tiers.tiers.length + 1}</button>}
       </div>
     </form>}

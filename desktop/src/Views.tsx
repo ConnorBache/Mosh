@@ -8,6 +8,7 @@ import {
 
 type Fail = (error: unknown) => void
 type Individuality = { score: number | null; reason: string; recommended_target: number | null;
+  shortlist: { pieces_required: number | null; candidates: number | null; estimated_skim_bytes: number | null; clues: string[] };
   nearest: { id: string; name: string; overlap: number; verified_content_duplicate: boolean }[];
   signals: { tag: string; sampled_or_indexed_frequency: number }[] }
 type Vocabulary = { recommendation: string; proposals: { tag: string; evidence: { file: string; evidence: string }[] }[] }
@@ -103,6 +104,8 @@ export function Inspector({ item, generation, refresh, fail, close, show }: {
     {tab === 'Individuality' && individuality && <section className="inspect-block">
       <h3>{individuality.score == null ? 'Score unavailable' : `${individuality.score} / 100`}</h3>
       <p>{individuality.reason}</p>
+      {individuality.shortlist.candidates != null && <p>{individuality.shortlist.pieces_required ?? individuality.shortlist.clues.length} clues · {individuality.shortlist.candidates} candidates · {bytes(individuality.shortlist.estimated_skim_bytes ?? 0)} estimated skim</p>}
+      {individuality.shortlist.clues.length > 0 && <p>{individuality.shortlist.clues.join(' · ')}</p>}
       {individuality.recommended_target && <p>Suggested target T{individuality.recommended_target}</p>}
       {individuality.signals.length > 0 && <><h3>Distinguishing tags</h3>
         <ul>{individuality.signals.map(signal => <li key={signal.tag}>{signal.tag} · {signal.sampled_or_indexed_frequency} occurrences</li>)}</ul></>}
@@ -133,11 +136,11 @@ export function Inspector({ item, generation, refresh, fail, close, show }: {
 
 export function TagExplorer({ generation, search, fail }: { generation: number; search: (query: string) => void; fail: Fail }) {
   const [tags, setTags] = useState<TagCount[]>([])
-  const [coverage, setCoverage] = useState<{ covered: number; objects: number }>()
+  const [coverage, setCoverage] = useState<{ covered: number; evaluated: number; objects: number }>()
   const [filter, setFilter] = useState('')
   const [selection, setSelection] = useState<Record<string, 'include' | 'exclude'>>({})
   useEffect(() => {
-    Promise.all([ledger<TagCount[]>('tag_catalog', { limit: 1000 }), ledger<{ covered: number; objects: number }>('tag_coverage')])
+    Promise.all([ledger<TagCount[]>('tag_catalog', { limit: 1000 }), ledger<{ covered: number; evaluated: number; objects: number }>('tag_coverage')])
       .then(([tags, coverage]) => { setTags(tags); setCoverage(coverage) }).catch(fail)
   }, [generation])
   const query = Object.entries(selection).map(([name, mode]) => (mode === 'exclude' ? 'NOT ' : '') + 'tag:' + quoted(name)).join(' AND ')
@@ -150,7 +153,7 @@ export function TagExplorer({ generation, search, fail }: { generation: number; 
     })
   }
   return <section className="area">
-    <div className="heading"><div><h1>Tag Explorer</h1>{coverage && <p>{coverage.covered.toLocaleString()} of {coverage.objects.toLocaleString()} files meet their target tier’s tag minimum</p>}</div>
+    <div className="heading"><div><h1>Tag Explorer</h1>{coverage && <p>{coverage.covered.toLocaleString()} of {coverage.evaluated.toLocaleString()} evaluated files meet their target tier’s Individuality floor{coverage.evaluated < coverage.objects && ` · ${coverage.objects.toLocaleString()} visible files`}</p>}</div>
       <button className="primary" disabled={!query} onClick={() => search(query)}><Search size={16} /> Search selection</button></div>
     <div className="toolbar"><input aria-label="Filter tag catalog" placeholder="Filter tags" value={filter} onChange={(event) => setFilter(event.target.value)} />
       <span className="query-caption">{query}</span></div>

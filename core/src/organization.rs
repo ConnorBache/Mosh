@@ -273,17 +273,34 @@ impl Mosh {
 
     pub fn tag_coverage(&self) -> Result<Value> {
         let readable = crate::security::allowed("paint");
-        let sql = format!(
-            "{AUTHORITY} SELECT count(*),coalesce(sum(f.effective=f.target),0),
-            coalesce(sum(s.confirmed),0) FROM objects o JOIN object_keys k ON k.object=o.id
-            JOIN file_tiers f ON f.object_key=k.key LEFT JOIN tag_sets s ON s.id=k.tag_set
-            WHERE o.missing=0 AND {VISIBLE} AND {readable}"
-        );
-        Ok(self.db.query_row(&sql,params![self.actor,std::path::MAIN_SEPARATOR_STR],|r| {
-            let total = r.get::<_,i64>(0)?;
-            let covered = r.get::<_,i64>(1)?;
-            Ok(json!({"objects":total,"covered":covered,"incomplete":total-covered,"direct_assignments":r.get::<_,i64>(2)?}))
-        })?)
+        let eligible = format!("o.missing=0 AND o.kind_code=0 AND {VISIBLE} AND {readable}");
+        let (total, assigned): (i64, i64) = self.db.query_row(
+            &format!(
+                "{AUTHORITY} SELECT count(*),coalesce(sum(s.confirmed),0)
+            FROM objects o LEFT JOIN tag_sets s ON s.id=o.tag_set WHERE {eligible}"
+            ),
+            params![self.actor, std::path::MAIN_SEPARATOR_STR],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let mut statement = self.db.prepare(&format!(
+            "{AUTHORITY} SELECT o.* FROM objects o WHERE {eligible} ORDER BY o.key LIMIT 32"
+        ))?;
+        let sample = statement
+            .query_map(params![self.actor, std::path::MAIN_SEPARATOR_STR], object)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut covered = 0;
+        let mut evaluated = 0;
+        for file in &sample {
+            let tier = self.file_tier_for(file)?;
+            if !tier["individuality_score"].is_null() {
+                evaluated += 1;
+                covered += i64::from(tier["effective"] == tier["target"]);
+            }
+        }
+        Ok(
+            json!({"objects":total,"evaluated":evaluated,"covered":covered,"incomplete":evaluated-covered,
+            "unevaluated":total-evaluated,"direct_assignments":assigned}),
+        )
     }
 
     pub fn tag_dictionary(&self, action: &str, from: &str, to: Option<&str>) -> Result<()> {
@@ -431,10 +448,10 @@ impl Mosh {
             &self.db,
             rusqlite::TransactionBehavior::Immediate,
         )?;
-        let id = crate::lean::next_id(&tx)?;
-        tx.execute(
-            "INSERT INTO objects(id,kind_code,name) VALUES(?,?,?)",
-            params![id, if marriage { 2 } else { 1 }, name.trim()],
+        let id: String = tx.query_row(
+            "INSERT INTO objects(kind_code,name) VALUES(?,?) RETURNING id",
+            params![if marriage { 2 } else { 1 }, name.trim()],
+            |row| row.get(0),
         )?;
         tx.execute("INSERT INTO owners VALUES(?,?)", params![id, self.actor])?;
         event(

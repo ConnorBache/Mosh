@@ -102,6 +102,15 @@ A Windows release build from format 9 commit `8e923ab` and a format 10 release b
 - An extra file in an already indexed directory used **79 search-index bytes** within existing pages in both format 10 fixtures. Format 9 used 335 bytes in the dense fixture and 334 bytes in the sparse fixture. The directory document count stayed the same after adding the file. Shared index growth varies with the new terms and any segment merges.
 - A directory-term search returned the same ten files across both formats and took 59 ms before and 51 ms after on the dense fixture. A phrase spanning the directory and filename returned the same results and took 58 ms before and 77 ms after. CLI startup is included. The copied format 9 Ledger retained its original file ID, user tag, Paint, and live accented-content match after upgrade.
 
+## Format 11 identity and tier storage
+
+Windows release builds for formats 10 and 11 indexed the same 10,000 generated C files, each 4,096 bytes, in the same 100 directories. Both runs used filesystem tags and left the source-text cache and inference off.
+
+- The compacted Ledger fell from **3,264,512 to 2,674,688 bytes**, or **326.45 to 267.47 bytes per file** including the empty Ledger. Excluding the empty Ledger, indexing added **287.13 before and 228.97 bytes per file after**. Computed tiers removed 315,392 bytes of file-tier growth. Integer identity consolidation removed another 266,240 bytes of file-row and mapping growth. The empty Ledger shrank by 8,192 bytes.
+- Format 11 added **88.47 bytes/file** for file rows, **11.88** for the generated public-ID index, **85.61** for the existing file lookup indexes, **30.31** for metadata text search, **9.42** for the shared tag-set lookup, and **3.28** for shared directory paths. It added **zero** ordinary tier rows. Reading a tier did not add a row.
+- Initial scan time went from **13.51 to 5.92 s**. The unchanged rescan went from **3.02 to 2.98 s**. One default tier inspection took **45 to 66 ms** including CLI startup. These timings describe the generated Windows fixture.
+- A real format 10 backup kept the selected file's ID, user tag, Paint, and locked override through upgrade. It retained one explicit tier row. The tier fixture verifies a two-clue shortlist that a greedy first-clue choice alone would miss, and verifies a higher Individuality floor for a larger file.
+
 ## Preview retrieval evaluation
 
 `cargo test --locked --release --test retrieval_quality -- --nocapture` evaluates 38 generated files and tracks tuned and held-out questions separately. The one tuned miss moved to rank one. On six held-out queries, top-1 accuracy, recall@3, and MRR each rose from **0.50 to 1.00**. Mean held-out latency rose from **1.65 to 2.06 ms**. The compacted database occupied **385,024 bytes**, or **10,132 bytes per file**, before and after within this small fixture's page allocation. The trial spent zero model tokens. A separate test rejects an improvement to the primary query when it demotes a known result in a control query.

@@ -17,7 +17,7 @@
 ## Intelligent Ledger
 
 - [x] Migrate from Ledger formats 1 and 2 while carrying forward file identities, existing tags and aliases, Paint, permissions, and virtual relationships.
-- [x] Compute target and effective tiers separately. Enforce configurable minimums of distinct confirmed direct tags, persist score components, and report unmet floors. Optional tiers can be configured through T10.
+- [x] Compute target and effective tiers separately. Compute ordinary assessments on demand, store exceptional state, and enforce configurable Individuality floors using an authorized skim shortlist. Optional tiers can be configured through T10.
 - [x] Configure model roles for Ollama, OpenAI, and compatible endpoints. Record usage and gate remote inference on Ledger budgets and source permissions.
 - [x] Queue revision-scoped enrichment, retain evidence, enforce Paint locks, and invalidate source-derived tags after changes.
 - [x] Track registry IDs, aliases, lifecycle decisions, and retrospective coverage. Expose operations through the CLI and Tag Registry.

@@ -40,7 +40,7 @@ enum Command {
         #[arg(long, default_value = "{}")]
         json: String,
     },
-    /// Compare the file's confirmed tags against its nearest permitted neighbors.
+    /// Estimate how many confirmed clues narrow the file to a permitted skim shortlist.
     Individuality {
         reference: String,
     },

@@ -314,13 +314,14 @@ fn storage_churn_workload() -> Result<()> {
                 mosh.db.execute_batch("DROP TRIGGER unique_live_path_insert; DROP TRIGGER unique_live_path_update;
                     DROP INDEX live_path_key; CREATE UNIQUE INDEX live_path ON objects(path) WHERE missing=0 AND path IS NOT NULL;
                     DROP INDEX object_git; CREATE INDEX object_git ON objects(git_root,git_status);
-                    CREATE INDEX file_tier_rank ON file_tiers(effective,object_key);
                     DROP INDEX object_parent;
                     CREATE INDEX object_parent ON objects(parent,missing,name COLLATE NOCASE,id);
                     UPDATE file_tiers SET assessor='filesystem' WHERE assessor='f';")?;
                 mosh.compact()?;
                 legacy = json!({"storage":mosh.storage_usage()?,"exact_path_mean_ms":index_read(false)?});
-                mosh.db.execute_batch(include_str!("ledger_v6.sql"))?;
+                mosh.db.execute_batch(
+                    &include_str!("ledger_v6.sql").replace("DROP INDEX file_tier_rank;", ""),
+                )?;
                 mosh.db
                     .execute_batch("DROP TRIGGER unique_live_path_update;")?;
                 mosh.db.execute_batch(&path_update)?;

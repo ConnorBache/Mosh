@@ -1,4 +1,4 @@
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, functions::FunctionFlags, params, types::Value};
 use std::{
     fs,
@@ -89,7 +89,7 @@ pub(crate) fn normalize_legacy_paths(db: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn encode_key(mut key: u64) -> String {
+pub(crate) fn encode_key(mut key: u64) -> String {
     const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
     let mut bytes = [0; 12];
     let mut start = bytes.len();
@@ -106,14 +106,14 @@ fn encode_key(mut key: u64) -> String {
     String::from_utf8(bytes[start..].to_vec()).expect("object key uses ASCII")
 }
 
-pub(crate) fn next_id(db: &Connection) -> Result<String> {
+pub(crate) fn next_key(db: &Connection) -> Result<i64> {
     let last: i64 = db
-        .prepare_cached("SELECT seq FROM sqlite_sequence WHERE name='object_keys'")?
+        .prepare_cached("SELECT seq FROM sqlite_sequence WHERE name='objects'")?
         .query_row([], |row| row.get(0))
         .optional()?
         .unwrap_or_default();
     ensure!(last >= 0 && last < i64::MAX, "Ledger object keys exhausted");
-    Ok(encode_key((last + 1) as u64))
+    Ok(last + 1)
 }
 
 pub(crate) fn alias_value(id: &str) -> Value {
@@ -205,8 +205,8 @@ pub(crate) fn register(db: &Connection) -> Result<()> {
             Ok(path.map(|path| blake3::hash(path.as_bytes()).as_bytes()[..8].to_vec()))
         },
     )?;
-    db.create_scalar_function("mosh_object_id", 1, flags, |ctx| {
-        Ok(encode_key(ctx.get::<i64>(0)? as u64))
+    db.create_scalar_function("mosh_object_id", 1, generated, |ctx| {
+        Ok(ctx.get::<Option<i64>>(0)?.map(|key| encode_key(key as u64)))
     })?;
     db.create_scalar_function("mosh_legacy_id", 1, flags, |ctx| {
         Ok(alias_value(ctx.get::<String>(0)?.as_str()))
@@ -228,6 +228,110 @@ pub(crate) fn file_extension(name: &str, file: bool) -> String {
         .and_then(|ext| ext.to_str())
         .unwrap_or("")
         .to_lowercase()
+}
+
+fn schema_for(db: &Connection, table: &str, triggers: bool) -> Result<Vec<String>> {
+    let mut query = db.prepare(
+        "SELECT sql FROM sqlite_schema WHERE tbl_name=?1 AND sql IS NOT NULL
+        AND (type='index' OR (?2 AND type='trigger')) ORDER BY type,name",
+    )?;
+    Ok(query
+        .query_map(params![table, triggers], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+pub(crate) fn consolidate_keys(db: &Connection) -> Result<()> {
+    let sequence: i64 = db.query_row(
+        "SELECT coalesce((SELECT seq FROM sqlite_sequence WHERE name='object_keys'),0)",
+        [],
+        |r| r.get(0),
+    )?;
+    let dependents: Vec<(String, String)> = db
+        .prepare(
+            "SELECT name,sql FROM sqlite_schema s WHERE type='table' AND EXISTS(
+            SELECT 1 FROM pragma_foreign_key_list(s.name) AS fk WHERE fk.[table]='object_keys')",
+        )?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let indexes_and_triggers = schema_for(db, "objects", true)?;
+    db.execute_batch("DROP TRIGGER refresh_tag_minimum;
+        ALTER TABLE tiers DROP COLUMN minimum_tags;
+        ALTER TABLE tiers ADD COLUMN minimum_individuality INTEGER NOT NULL DEFAULT 0 CHECK(minimum_individuality BETWEEN 0 AND 100);
+        UPDATE tiers SET minimum_individuality=CASE level WHEN 1 THEN 0 WHEN 2 THEN 60 WHEN 3 THEN 80 WHEN 4 THEN 90 ELSE 95 END;
+        DELETE FROM file_tiers WHERE assessor IN ('f','filesystem') AND assessment IS NULL
+            AND requested IS NULL AND locked=0 AND human_accesses=0 AND last_access IS NULL;
+        ALTER TABLE file_tiers DROP COLUMN effective;")?;
+    db.execute_batch(include_str!("ledger_v11_objects.sql"))?;
+    let loss: i64 = db.query_row(
+        "SELECT (SELECT count(*) FROM objects)-(SELECT count(*) FROM objects_next)",
+        [],
+        |row| row.get(0),
+    )?;
+    ensure!(loss == 0, "a file is missing its Ledger key");
+    db.execute_batch(
+        "DROP TABLE objects; ALTER TABLE objects_next RENAME TO objects;
+        DROP TABLE object_keys;
+        CREATE VIEW object_keys AS SELECT key,id AS object,tag_set FROM objects;
+        CREATE TRIGGER object_keys_tag_update INSTEAD OF UPDATE OF tag_set ON object_keys BEGIN
+            UPDATE objects SET tag_set=NEW.tag_set WHERE key=OLD.key;
+        END;
+        CREATE INDEX tag_set_owners ON objects(tag_set) WHERE tag_set IS NOT NULL;",
+    )?;
+    db.execute(
+        "UPDATE sqlite_sequence SET seq=max(seq,?) WHERE name='objects'",
+        [sequence],
+    )?;
+    db.execute(
+        "INSERT INTO sqlite_sequence(name,seq) SELECT 'objects',?1 WHERE ?1>0
+         AND NOT EXISTS(SELECT 1 FROM sqlite_sequence WHERE name='objects')",
+        [sequence],
+    )?;
+    for statement in indexes_and_triggers {
+        if !statement.starts_with("CREATE TRIGGER ledger_insert ") {
+            db.execute_batch(&statement)?;
+        }
+    }
+    db.execute_batch(
+        "CREATE TRIGGER ledger_insert AFTER INSERT ON objects WHEN NEW.missing=0 BEGIN
+         INSERT INTO ledger(rowid,name,paint) VALUES(NEW.key,NEW.name,''); END;",
+    )?;
+    for (table, original) in dependents {
+        let sql = if table == "file_tiers" {
+            db.query_row(
+                "SELECT sql FROM sqlite_schema WHERE name='file_tiers'",
+                [],
+                |row| row.get(0),
+            )?
+        } else {
+            original
+        };
+        let table_definition = &sql[sql.find('(').context("missing table definition")?..];
+        let replaced =
+            table_definition.replace("REFERENCES object_keys(key)", "REFERENCES objects(key)");
+        ensure!(
+            replaced != table_definition,
+            "cannot remap foreign keys for {table}"
+        );
+        let related = schema_for(db, &table, true)?;
+        let table = format!("\"{}\"", table.replace('"', "\"\""));
+        db.execute_batch(&format!(
+            "CREATE TABLE mosh_rebind{replaced};
+             INSERT INTO mosh_rebind SELECT * FROM {table};
+             DROP TABLE {table}; ALTER TABLE mosh_rebind RENAME TO {table};"
+        ))?;
+        for statement in related {
+            db.execute_batch(&statement)?;
+        }
+    }
+    let violations: i64 =
+        db.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })?;
+    ensure!(
+        violations == 0,
+        "identity migration found {violations} foreign key violations"
+    );
+    Ok(())
 }
 
 pub(crate) fn migrate(db: &Connection) -> Result<()> {

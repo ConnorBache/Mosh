@@ -7,6 +7,156 @@ use std::collections::{BTreeMap, BTreeSet};
 const CANDIDATES: usize = 96;
 const SEEDS: usize = 8;
 const HIGH_OVERLAP: f64 = 0.80;
+const SHORTLIST_FILES: i64 = 8;
+const SHORTLIST_BYTES: i64 = 32 * 1024;
+const PEEK_BYTES: i64 = 8 * 1024;
+const SHORTLIST_SIGNALS: usize = 12;
+const SHORTLIST_STEPS: usize = 8;
+
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct Skim {
+    pub score: Option<u8>,
+    pub pieces_required: Option<usize>,
+    candidates: Option<i64>,
+    estimated_skim_bytes: Option<i64>,
+    max_candidates: i64,
+    max_skim_bytes: i64,
+    max_peek_bytes_per_file: i64,
+    clues: Vec<String>,
+    pub reason: &'static str,
+}
+
+pub(crate) fn skim(db: &Connection, actor: &str, key: i64) -> Result<Skim> {
+    let visible = organization::VISIBLE;
+    let read = crate::security::allowed("paint");
+    let content = crate::security::allowed("content");
+    let authority = organization::AUTHORITY;
+    let scope = format!("o.kind_code=0 AND o.missing=0 AND {visible} AND {read} AND {content}");
+    let eligible: bool = db.query_row(
+        &format!("{authority} SELECT EXISTS(SELECT 1 FROM objects o WHERE o.key=?3 AND {scope})"),
+        params![actor, std::path::MAIN_SEPARATOR_STR, key],
+        |r| r.get(0),
+    )?;
+    let mut outcome = Skim {
+        score: None,
+        pieces_required: None,
+        candidates: None,
+        estimated_skim_bytes: None,
+        max_candidates: SHORTLIST_FILES,
+        max_skim_bytes: SHORTLIST_BYTES,
+        max_peek_bytes_per_file: PEEK_BYTES,
+        clues: Vec::new(),
+        reason: "The viewer cannot skim this file.",
+    };
+    if !eligible {
+        return Ok(outcome);
+    }
+
+    let measure = |clues: &[i64]| -> Result<(i64, i64)> {
+        let mut filter = String::new();
+        if !clues.is_empty() {
+            let mut joins = String::new();
+            let mut packs = vec!["b0.packed".to_owned()];
+            for (index, _) in clues.iter().enumerate().skip(1) {
+                joins.push_str(&format!(
+                    " JOIN tag_blocks b{index} ON b{index}.block=b0.block
+                    AND b{index}.tag=?{} AND b{index}.suggested=0",
+                    index + 3
+                ));
+                packs.push(format!("b{index}.packed"));
+            }
+            filter = format!("AND o.key IN(SELECT b0.block*4096+slots.value FROM tag_blocks b0
+                {joins} JOIN json_each(mosh_common_slots({})) slots WHERE b0.tag=?3 AND b0.suggested=0)",packs.join(","));
+        }
+        let inputs = std::iter::once(actor.to_owned().into())
+            .chain(std::iter::once(
+                std::path::MAIN_SEPARATOR_STR.to_owned().into(),
+            ))
+            .chain(clues.iter().copied().map(rusqlite::types::Value::Integer));
+        Ok(db
+            .prepare_cached(&format!(
+                "{authority} SELECT count(*),coalesce(sum(min(max(o.size,1),{PEEK_BYTES})),0)
+            FROM objects o WHERE {scope} {filter}"
+            ))?
+            .query_row(rusqlite::params_from_iter(inputs), |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?)
+    };
+    let fits = |(files, bytes): (i64, i64)| files <= SHORTLIST_FILES && bytes <= SHORTLIST_BYTES;
+    let mut remaining = measure(&[])?;
+    let mut selected = Vec::new();
+    if !fits(remaining) {
+        let mut signals = packed_tags::confirmed(db, key)?
+            .into_iter()
+            .map(|tag| {
+                // A restricted viewer's ordering cannot be influenced by inaccessible files.
+                let rank = if actor == "local" { count(db, tag)? } else { 0 };
+                Ok((rank, tag))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        signals.sort_unstable();
+        signals.truncate(SHORTLIST_SIGNALS);
+        let mut useful = Vec::new();
+        for _ in 0..SHORTLIST_STEPS {
+            let mut best = None;
+            for &(_, tag) in signals.iter().filter(|(_, tag)| !selected.contains(tag)) {
+                let mut trial = selected.clone();
+                trial.push(tag);
+                let step = measure(&trial)?;
+                if selected.is_empty() && step != remaining {
+                    useful.push(tag);
+                }
+                if step != remaining
+                    && best
+                        .as_ref()
+                        .is_none_or(|(other, _)| (!fits(step), step) < (!fits(*other), *other))
+                {
+                    best = Some((step, tag));
+                }
+            }
+            let Some((step, tag)) = best else { break };
+            remaining = step;
+            selected.push(tag);
+            if fits(step) {
+                break;
+            }
+        }
+        // A locally stronger first clue can hide a better pair. Verify all useful
+        // pairs before charging more than two clues or reporting no shortlist.
+        if selected.len() > 2 || !fits(remaining) {
+            'pairs: for (index, &first) in useful.iter().enumerate() {
+                for &second in useful.iter().skip(index + 1) {
+                    let pair = measure(&[first, second])?;
+                    if fits(pair) {
+                        selected = vec![first, second];
+                        remaining = pair;
+                        break 'pairs;
+                    }
+                }
+            }
+        }
+    }
+    outcome.candidates = Some(remaining.0);
+    outcome.estimated_skim_bytes = Some(remaining.1);
+    outcome.clues = selected
+        .iter()
+        .map(|tag| name(db, *tag))
+        .collect::<Result<_>>()?;
+    if fits(remaining) {
+        outcome.pieces_required = Some(selected.len());
+        outcome.score = Some(100 - (selected.len().saturating_sub(1) as u8) * 10);
+        outcome.reason = if selected.is_empty() {
+            "The permitted scope already fits the skim budget."
+        } else {
+            "The selected confirmed clues narrow the permitted scope to a skimmable shortlist."
+        };
+    } else {
+        outcome.score = Some(0);
+        outcome.reason =
+            "The confirmed clues tested could not narrow the permitted scope to the skim budget.";
+    }
+    Ok(outcome)
+}
 
 struct Neighbor {
     object: Object,
@@ -161,7 +311,7 @@ impl Mosh {
         } else {
             HIGH_OVERLAP
         };
-        let score = if own.len() >= 2 {
+        let overlap_individuality = if own.len() >= 2 {
             closest.map(|nearest| ((1.0 - nearest.overlap) * 100.0).round() as u32)
         } else {
             None
@@ -175,7 +325,7 @@ impl Mosh {
             .iter()
             .filter(|n| !n.duplicate && n.overlap >= threshold)
             .count();
-        let reason = if own.len() < 2 {
+        let overlap_reason = if own.len() < 2 {
             "Too few confirmed direct tags to characterize this file."
         } else if collisions > 0 {
             "Distinct files share the same confirmed tag set."
@@ -225,7 +375,8 @@ impl Mosh {
                 None
             };
         Ok(
-            json!({"id":file.id,"score":score,"reason":reason,"nearest":nearest,"signals":distinct,
+            json!({"id":file.id,"score":tier["individuality_score"],"reason":tier["shortlist"]["reason"],"shortlist":tier["shortlist"],
+            "overlap_individuality":overlap_individuality,"overlap_reason":overlap_reason,"nearest":nearest,"signals":distinct,
             "confirmed_direct_tags":own.len(),"sample":neighbors.len(),"distinct_collisions":collisions,
             "high_overlap_distinct":close_distinct,"verified_duplicates":verified_duplicates,
             "overlap_threshold":threshold,"confirmed_queries":feedback_total,"difficult_queries":difficult,

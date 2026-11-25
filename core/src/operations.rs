@@ -556,10 +556,10 @@ impl Mosh {
         let mut writer = crate::packed_tags::Writer::new(&tx);
         let mut affected = Vec::new();
         if plan.action == Action::Marriage {
-            let id = crate::lean::next_id(&tx)?;
-            tx.execute(
-                "INSERT INTO objects(id,kind_code,name) VALUES(?,2,?)",
-                params![id, plan.argument],
+            let id: String = tx.query_row(
+                "INSERT INTO objects(kind_code,name) VALUES(2,?) RETURNING id",
+                [&plan.argument],
+                |row| row.get(0),
             )?;
             tx.execute("INSERT INTO owners VALUES(?,?)", params![id, self.actor])?;
             collection = Some(id);

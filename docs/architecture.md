@@ -12,7 +12,9 @@ The metadata index has one FTS5 document per object's name and Paint. Since form
 
 ## Packed tags
 
-The object registry assigns durable integer keys for packed lookups. The API uses a short, Ledger-local base-62 spelling of the key. Previously issued UUIDs remain usable through a compact alias table. Tag names and aliases resolve through the global tag dictionary.
+Format 11 assigns each object one durable integer primary key. The API generates its Ledger-local base-62 spelling from that key. Tagged objects refer to their packed set directly from the object row. Previously issued UUIDs remain usable through a compact alias table. Tag names and aliases resolve through the global tag dictionary.
+
+Default tier assessments are computed from the file's indexed metadata and the current tier rules. The Ledger saves exceptions for inference and user activity. Effective tiers use the current authorized shortlist, so a new clue or changed neighbor can change eligibility without a cached score per file. The estimated skim uses eight candidates, 32 KiB total, and up to 8 KiB per candidate. The evaluator tests up to twelve confirmed clues. It checks useful pairs and uses up to eight greedy narrowing steps for longer combinations. Large files have higher thresholds.
 
 ## Storage floor and tradeoffs
 

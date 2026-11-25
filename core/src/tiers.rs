@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 #[serde(deny_unknown_fields)]
 pub struct Tier {
     pub level: u8,
-    pub minimum_tags: u32,
+    pub minimum_individuality: u8,
     pub minimum_score: u8,
     pub passes: u8,
     pub paint: Option<String>,
@@ -47,9 +47,21 @@ pub(crate) struct Scores {
     pub hotness: u8,
 }
 
+struct SavedTier {
+    scores: Scores,
+    accesses: u32,
+    last_access: Option<i64>,
+    target: u8,
+    requested: Option<u8>,
+    locked: bool,
+    assessor: String,
+    assessment: Option<String>,
+    revision: i64,
+}
+
 pub(crate) fn key(db: &Connection, id: &str) -> Result<i64> {
     Ok(db
-        .prepare_cached("SELECT key FROM object_keys WHERE object=?")?
+        .prepare_cached("SELECT key FROM objects WHERE id=?")?
         .query_row([id], |r| r.get(0))?)
 }
 
@@ -77,13 +89,13 @@ pub(crate) fn set_setting(db: &Connection, name: &str, value: &impl Serialize) -
 
 pub(crate) fn policies(db: &Connection) -> Result<Vec<Tier>> {
     let mut statement = db.prepare_cached(
-        "SELECT level,minimum_tags,minimum_score,passes,paint,embed FROM tiers ORDER BY level",
+        "SELECT level,minimum_individuality,minimum_score,passes,paint,embed FROM tiers ORDER BY level",
     )?;
     Ok(statement
         .query_map([], |r| {
             Ok(Tier {
                 level: r.get(0)?,
-                minimum_tags: r.get(1)?,
+                minimum_individuality: r.get(1)?,
                 minimum_score: r.get(2)?,
                 passes: r.get(3)?,
                 paint: r.get(4)?,
@@ -139,6 +151,28 @@ fn predicted(path: &str, extension: &str) -> Scores {
     }
 }
 
+pub(crate) fn required_individuality(tier: &Tier, bytes: i64) -> u8 {
+    let extra = if bytes >= 128 * 1024 * 1024 {
+        30
+    } else if bytes >= 16 * 1024 * 1024 {
+        20
+    } else if bytes >= 1024 * 1024 {
+        10
+    } else {
+        0
+    };
+    tier.minimum_individuality.saturating_add(extra).min(100)
+}
+
+fn best_target(tiers: &[Tier], score: u8) -> u8 {
+    tiers
+        .iter()
+        .filter(|tier| tier.minimum_score <= score)
+        .map(|tier| tier.level)
+        .max()
+        .unwrap_or(1)
+}
+
 pub(crate) fn observed_hotness(predicted: u8, accesses: u32, last: Option<i64>, time: i64) -> u8 {
     let days = last
         .map(|last| (time.saturating_sub(last).max(0) / 86_400_000).min(64))
@@ -190,12 +224,7 @@ pub(crate) fn recompute(db: &Connection, key: i64, fresh: bool) -> Result<()> {
         &weights,
     );
     let previous_active = tiers.iter().any(|t| t.level == previous);
-    let applicable = tiers
-        .iter()
-        .filter(|t| t.minimum_score <= score)
-        .map(|t| t.level)
-        .max()
-        .unwrap_or(1);
+    let applicable = best_target(&tiers, score);
     let use_previous = previous_active
         && applicable != previous
         && !fresh
@@ -218,10 +247,8 @@ pub(crate) fn recompute(db: &Connection, key: i64, fresh: bool) -> Result<()> {
         } else {
             applicable
         });
-    db.prepare_cached("UPDATE file_tiers SET target=?2,effective=(
-        SELECT max(level) FROM tiers WHERE level<=?2 AND minimum_tags<=coalesce(
-            (SELECT s.confirmed FROM object_keys k JOIN tag_sets s ON k.tag_set=s.id WHERE k.key=?1),0))
-        WHERE object_key=?1")?.execute(params![key,target])?;
+    db.prepare_cached("UPDATE file_tiers SET target=?2 WHERE object_key=?1")?
+        .execute(params![key, target])?;
     Ok(())
 }
 
@@ -256,21 +283,47 @@ pub(crate) fn assess(
 }
 
 pub(crate) fn indexed(db: &Connection, id: &str) -> Result<()> {
-    let (key, revision, path, extension): (i64, i64, String, String) = db
+    let (key, revision, exceptional): (i64, i64, bool) = db
         .prepare_cached(
-            "SELECT k.key,o.revision,coalesce(o.path,''),coalesce(o.extension,'')
-        FROM objects o JOIN object_keys k ON o.id=k.object WHERE o.id=?",
+            "SELECT o.key,o.revision,EXISTS(SELECT 1 FROM file_tiers f WHERE f.object_key=o.key)
+        FROM objects o WHERE o.id=?",
         )?
-        .query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
-    assess(
-        db,
-        key,
-        revision,
-        &predicted(&path, &extension),
-        "filesystem",
-        None,
-    )?;
+        .query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    if exceptional {
+        let (path, extension): (String, String) = db
+            .prepare_cached(
+                "SELECT coalesce(path,''),coalesce(extension,'') FROM objects WHERE key=?",
+            )?
+            .query_row([key], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        assess(
+            db,
+            key,
+            revision,
+            &predicted(&path, &extension),
+            "filesystem",
+            None,
+        )?;
+        prune_default(db, key)?;
+    }
     crate::intelligence::index_changed(db, id, revision)?;
+    Ok(())
+}
+
+fn prune_default(db: &Connection, key: i64) -> Result<()> {
+    db.prepare_cached("DELETE FROM file_tiers WHERE object_key=? AND assessor IN ('f','filesystem')
+         AND assessment IS NULL AND requested IS NULL AND locked=0 AND human_accesses=0 AND last_access IS NULL")?.execute([key])?;
+    Ok(())
+}
+
+fn save_default(db: &Connection, object: &Object, key: i64) -> Result<()> {
+    let scores = predicted(
+        object.path.as_deref().unwrap_or(""),
+        object.extension.as_deref().unwrap_or(""),
+    );
+    let weights: Weights = setting(db, "tier_weights")?;
+    let target = best_target(&policies(db)?, weighted(&scores, scores.hotness, &weights));
+    db.prepare_cached("INSERT OR IGNORE INTO file_tiers(object_key,revision,importance,information,predicted_hotness,target,assessor,assessed)
+        VALUES(?,?,?,?,?,?,'f',?)")?.execute(params![key,object.revision,scores.importance,scores.information,scores.hotness,target,now()])?;
     Ok(())
 }
 
@@ -332,16 +385,16 @@ impl Mosh {
         for tier in tiers {
             ensure!(
                 (1..=10).contains(&tier.level)
-                    && tier.minimum_tags >= 1
+                    && tier.minimum_individuality <= 100
                     && tier.minimum_score <= 100
                     && (1..=8).contains(&tier.passes),
                 "invalid tier definition"
             );
             tx.execute(
-                "INSERT INTO tiers VALUES(?,?,?,?,?,?)",
+                "INSERT INTO tiers(level,minimum_individuality,minimum_score,passes,paint,embed) VALUES(?,?,?,?,?,?)",
                 params![
                     tier.level,
-                    tier.minimum_tags,
+                    tier.minimum_individuality,
                     tier.minimum_score,
                     tier.passes,
                     tier.paint,
@@ -384,27 +437,79 @@ impl Mosh {
     }
 
     pub(crate) fn file_tier_for(&self, obj: &Object) -> Result<Value> {
-        let value=self.db.prepare_cached("SELECT f.importance,f.information,f.predicted_hotness,f.human_accesses,f.last_access,
-            f.target,f.effective,f.requested,f.locked,
+        if obj.kind != "file" {
+            return Ok(Value::Null);
+        }
+        let key = key(&self.db, &obj.id)?;
+        let saved=self.db.prepare_cached("SELECT f.importance,f.information,f.predicted_hotness,f.human_accesses,f.last_access,
+            f.target,f.requested,f.locked,
             CASE f.assessor WHEN 'f' THEN 'filesystem' WHEN 'a' THEN 'ai' ELSE f.assessor END,
-            f.assessment,f.revision,
-            coalesce(s.confirmed,0),t.minimum_tags FROM object_keys k JOIN file_tiers f ON f.object_key=k.key
-            LEFT JOIN tag_sets s ON k.tag_set=s.id JOIN tiers t ON t.level=f.target WHERE k.object=?")?
-            .query_row([&obj.id],|r| {
-                let target=r.get::<_,u8>(5)?;
-                let effective=r.get::<_,Option<u8>>(6)?;
-                let count=r.get::<_,u32>(12)?;
-                let required=r.get::<_,u32>(13)?;
-                let forecast=r.get::<_,u8>(2)?;
-                let accesses=r.get::<_,u32>(3)?;
-                Ok(json!({"importance":r.get::<_,u8>(0)?,"information":r.get::<_,u8>(1)?,
-                    "predicted_hotness":forecast,"hotness":observed_hotness(forecast,accesses,r.get(4)?,now()),
-                    "human_accesses":accesses,"target":target,"effective":effective,"requested":r.get::<_,Option<u8>>(7)?,
-                    "locked":r.get::<_,bool>(8)?,"assessor":r.get::<_,String>(9)?,"assessment":r.get::<_,Option<String>>(10)?,
-                    "revision":r.get::<_,i64>(11)?,"direct_tags":count,"minimum_tags":required,
-                    "downgrade":(effective!=Some(target)).then(||format!("T{target} requires {required} distinct confirmed direct tags; this file has {count}."))}))
+            f.assessment,f.revision FROM file_tiers f WHERE f.object_key=?")?
+            .query_row([key],|r| {
+                Ok(SavedTier { scores: Scores { importance:r.get(0)?,information:r.get(1)?,hotness:r.get(2)? },
+                    accesses:r.get(3)?,last_access:r.get(4)?,target:r.get(5)?,requested:r.get(6)?,locked:r.get(7)?,
+                    assessor:r.get(8)?,assessment:r.get(9)?,revision:r.get(10)? })
             }).optional()?;
-        Ok(value.unwrap_or(Value::Null))
+        let policies = policies(&self.db)?;
+        let persisted = saved.is_some();
+        let state = match saved {
+            Some(state) => state,
+            None => {
+                let scores = predicted(
+                    obj.path.as_deref().unwrap_or(""),
+                    obj.extension.as_deref().unwrap_or(""),
+                );
+                let weights: Weights = setting(&self.db, "tier_weights")?;
+                let target = best_target(&policies, weighted(&scores, scores.hotness, &weights));
+                SavedTier {
+                    scores,
+                    accesses: 0,
+                    last_access: None,
+                    target,
+                    requested: None,
+                    locked: false,
+                    assessor: "filesystem".into(),
+                    assessment: None,
+                    revision: obj.revision,
+                }
+            }
+        };
+        let shortlist = crate::individuality::skim(&self.db, &self.actor, key)?;
+        let target = state.target;
+        let required = policies
+            .iter()
+            .find(|t| t.level == target)
+            .map_or(0, |t| required_individuality(t, obj.size));
+        let effective = policies
+            .iter()
+            .filter(|t| {
+                t.level <= target
+                    && shortlist
+                        .score
+                        .is_some_and(|s| s >= required_individuality(t, obj.size))
+            })
+            .map(|t| t.level)
+            .max();
+        let count: i64=self.db.prepare_cached("SELECT coalesce(s.confirmed,0) FROM objects o LEFT JOIN tag_sets s ON s.id=o.tag_set WHERE o.key=?")?
+            .query_row([key],|r|r.get(0))?;
+        let hotness = observed_hotness(
+            state.scores.hotness,
+            state.accesses,
+            state.last_access,
+            now(),
+        );
+        let downgrade=(effective!=Some(target)).then(||match shortlist.score {
+            Some(score)=>format!("T{target} requires Individuality {required}; this file scores {score}."),
+            None=>format!("T{target} requires Individuality {required}; a permitted skim could not be evaluated."),
+        });
+        Ok(
+            json!({"importance":state.scores.importance,"information":state.scores.information,
+            "predicted_hotness":state.scores.hotness,"hotness":hotness,"human_accesses":state.accesses,
+            "target":target,"effective":effective,"requested":state.requested,"locked":state.locked,
+            "assessor":state.assessor,"assessment":state.assessment,"revision":state.revision,
+            "direct_tags":count,"minimum_individuality":required,"individuality_score":shortlist.score,
+            "shortlist":shortlist,"stored_assessment":persisted,"downgrade":downgrade}),
+        )
     }
 
     pub fn override_tier(
@@ -424,11 +529,13 @@ impl Mosh {
             );
         }
         let key = key(&tx, &object.id)?;
+        save_default(&tx, &object, key)?;
         tx.execute(
             "UPDATE file_tiers SET requested=?,locked=? WHERE object_key=?",
             params![requested, locked, key],
         )?;
         recompute(&tx, key, true)?;
+        prune_default(&tx, key)?;
         crate::event(
             &tx,
             Some(&object.id),
@@ -448,6 +555,7 @@ impl Mosh {
         }
         let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
         let key = key(&tx, &object.id)?;
+        save_default(&tx, object, key)?;
         tx.execute("UPDATE file_tiers SET human_accesses=min(human_accesses+1,2147483647),last_access=? WHERE object_key=?",params![now(),key])?;
         recompute(&tx, key, false)?;
         tx.commit()?;
@@ -543,12 +651,10 @@ mod scale_test {
         let migration_time = migration.elapsed();
         let current_bytes = fs::metadata(&path)?.len();
         let current_id = ledger.get("file-1000000")?.id;
-        let count: u64 = ledger.db.query_row(
-            "SELECT count(*) FROM file_tiers WHERE effective=1",
-            [],
-            |r| r.get(0),
-        )?;
-        assert_eq!(count, 1_000_000);
+        let count: u64 = ledger
+            .db
+            .query_row("SELECT count(*) FROM file_tiers", [], |r| r.get(0))?;
+        assert_eq!(count, 0);
         let mut query = ledger.db.prepare(
             "SELECT k.object FROM ledger JOIN object_keys k ON ledger.rowid=k.key
             WHERE ledger MATCH 'name:file1000000'",

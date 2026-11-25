@@ -67,7 +67,7 @@ try {
   await page.locator('.sidebar').getByRole('button', { name: 'Sample workspace', exact: true }).click()
   await page.getByRole('heading', { name: 'Sample workspace' }).waitFor()
   if (legacy) {
-    assert.equal(version(db), 10)
+    assert.equal(version(db), 11)
     assert.equal(version(oldDb), 1)
   }
   await page.getByRole('button', { name: 'Orbit.md', exact: true }).click()
@@ -139,8 +139,8 @@ try {
 
   await nav('Settings').click()
   const tierTwo = page.getByRole('group', { name: 'T2', exact: true })
-  assert.equal(await tierTwo.getByLabel('Minimum tags').inputValue(), '5')
-  await tierTwo.getByLabel('Minimum tags').fill('6')
+  assert.equal(await tierTwo.getByLabel('Minimum Individuality').inputValue(), '60')
+  await tierTwo.getByLabel('Minimum Individuality').fill('65')
   await page.getByRole('button', { name: 'Save tiers' }).click()
   await page.getByRole('status').filter({ hasText: 'Tiers saved' }).waitFor()
   await nav('Agents').click()

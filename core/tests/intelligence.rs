@@ -49,73 +49,74 @@ impl Fixture {
 }
 
 #[test]
-fn tier_floors_are_configurable_and_count_distinct_confirmed_direct_tags() -> Result<()> {
+fn tier_floors_follow_shortlist_clues_and_file_size_without_default_rows() -> Result<()> {
     let f = Fixture::new()?;
-    let file = f.write("priority.txt", "Assess this proposal.")?;
+    let mut paths = Vec::new();
+    for n in 0..20 {
+        paths.push(f.write(&format!("proposal-{n:02}.txt"), "Review this proposal.")?);
+    }
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&paths[1])?
+        .set_len(1024 * 1024)?;
     f.scan()?;
-    let id = f.indexed(&file)?;
-    let parent = f.indexed(&f.root)?;
+    let ids = paths
+        .iter()
+        .map(|file| f.indexed(file))
+        .collect::<Result<Vec<_>>>()?;
     let mut tiers: Vec<Tier> = serde_json::from_value(f.mosh.tier_settings()?["tiers"].clone())?;
     assert_eq!(
         tiers
             .iter()
-            .map(|tier| tier.minimum_tags)
+            .map(|tier| tier.minimum_individuality)
             .collect::<Vec<_>>(),
-        [1, 5, 10, 100]
+        [0, 60, 80, 90]
     );
-    assert!(f.mosh.override_tier(&id, Some(5), false).is_err());
-    f.mosh.tag(&parent, "inherited-only", true, 1.0)?;
-    let initial = f.mosh.override_tier(&id, Some(4), true)?;
-    assert_eq!(initial["effective"], 1);
-    assert!(initial["downgrade"].as_str().unwrap().contains("100"));
+    let initial = f.mosh.file_tier(&ids[0])?;
+    assert_eq!(initial["stored_assessment"], false);
+    assert_eq!(initial["individuality_score"], 0);
+    let raw = rusqlite::Connection::open(&f.db)?;
     assert_eq!(
-        f.mosh
-            .tags(&id)?
-            .iter()
-            .filter(|tag| tag["inherited"] == true && tag["name"] == "inherited-only")
-            .count(),
-        1
+        raw.query_row("SELECT count(*) FROM file_tiers", [], |r| r
+            .get::<_, i64>(0))?,
+        0
     );
-    let initial_tags = initial["direct_tags"].as_u64().unwrap();
-    for n in initial_tags + 1..=101 {
-        f.mosh.tag(&id, &format!("test-tag-{n}"), true, 1.0)?;
-        match n {
-            5 | 10 | 100 | 101 => {
-                let actual = f.mosh.file_tier(&id)?;
-                assert_eq!(actual["direct_tags"], n);
-                assert_eq!(
-                    actual["effective"],
-                    if n == 5 {
-                        2
-                    } else if n == 10 {
-                        3
-                    } else {
-                        4
-                    }
-                );
-                assert_eq!(actual["locked"], true);
-            }
-            _ => {}
+    assert!(f.mosh.override_tier(&ids[0], Some(5), false).is_err());
+    f.mosh.override_tier(&ids[0], Some(4), true)?;
+    f.mosh.override_tier(&ids[1], Some(4), true)?;
+    for (n, id) in ids.iter().enumerate() {
+        if n < 10 {
+            f.mosh.tag(id, "project-a", true, 1.0)?;
+        }
+        if n < 13 && n != 9 {
+            f.mosh.tag(id, "region-b", true, 1.0)?;
+        }
+        if n < 8 || n == 9 || (13..16).contains(&n) {
+            f.mosh.tag(id, "version-c", true, 1.0)?;
         }
     }
-    f.mosh.tag(&id, "test-tag-101", true, 1.0)?;
-    assert_eq!(f.mosh.file_tier(&id)?["direct_tags"], 101);
-    tiers[1].minimum_tags = 6;
-    tiers.push(Tier {
-        level: 5,
-        minimum_tags: 1_500,
-        minimum_score: 95,
-        passes: 3,
-        paint: None,
-        embed: false,
-    });
+    let small = f.mosh.file_tier(&ids[0])?;
+    let large = f.mosh.file_tier(&ids[1])?;
+    assert_eq!(small["shortlist"]["pieces_required"], 2);
+    assert_eq!(small["shortlist"]["candidates"], 8);
+    assert_eq!(small["individuality_score"], 90);
+    assert_eq!(small["effective"], 4);
+    assert_eq!(large["minimum_individuality"], 100);
+    assert_eq!(large["effective"], 3);
+    assert_eq!(large["locked"], true);
+    let displayed = f.mosh.individuality(&ids[0])?;
+    assert_eq!(displayed["score"], small["individuality_score"]);
+    assert_eq!(displayed["shortlist"]["pieces_required"], 2);
+    tiers[3].minimum_individuality = 95;
     f.mosh.configure_tiers(&tiers, &Weights::default())?;
-    let updated = f.mosh.override_tier(&id, Some(5), true)?;
-    assert_eq!(updated["target"], 5);
-    assert_eq!(updated["effective"], 4);
-    assert_eq!(updated["minimum_tags"], 1500);
-    assert_eq!(f.mosh.file_tier(&id)?["direct_tags"], 101);
-    assert_eq!(f.mosh.tag_coverage()?["covered"], 0);
+    assert_eq!(f.mosh.file_tier(&ids[0])?["effective"], 3);
+    f.mosh.override_tier(&ids[0], None, false)?;
+    assert_eq!(f.mosh.file_tier(&ids[0])?["stored_assessment"], false);
+    assert_eq!(
+        raw.query_row("SELECT count(*) FROM file_tiers", [], |r| r
+            .get::<_, i64>(0))?,
+        1
+    );
     Ok(())
 }
 
@@ -336,7 +337,8 @@ fn structured_model_output_adds_only_grounded_tags_and_respects_tier_paint() -> 
     let assessed = f.mosh.file_tier(&id)?;
     assert_eq!(assessed["assessor"], "ai");
     assert_eq!(assessed["target"], 3);
-    assert_eq!(assessed["effective"], 2);
+    assert_eq!(assessed["effective"], 3);
+    assert_eq!(assessed["shortlist"]["pieces_required"], 0);
     assert_eq!(assessed["direct_tags"], 6);
     assert_eq!(f.mosh.paint(&id)?.unwrap()["level"], "minimal");
     assert!(f.mosh.passages(&id)?.is_empty());

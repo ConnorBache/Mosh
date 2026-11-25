@@ -74,6 +74,7 @@ impl ScanReport {
 
 #[derive(Debug)]
 struct Previous {
+    key: i64,
     id: String,
     path: String,
     kind: String,
@@ -96,10 +97,11 @@ fn previous(row: &rusqlite::Row<'_>) -> rusqlite::Result<Previous> {
         size: row.get(6)?,
         changed: row.get(7)?,
         reparse: row.get(8)?,
+        key: row.get(9)?,
     })
 }
 
-const STAMP: &str = "id,path,kind,native_id,created,modified,size,changed,reparse";
+const STAMP: &str = "id,path,kind,native_id,created,modified,size,changed,reparse,key";
 
 fn forgotten(db: &Connection, path: &str, full_scan: bool) -> Result<u64> {
     let (low, high) = prefix(path);
@@ -249,21 +251,24 @@ fn index_one(
     });
     let renamed = previous.as_ref().is_some_and(|old| old.path != key);
     let new = previous.is_none();
-    let id = match &previous {
-        Some(previous) => previous.id.clone(),
-        None => crate::lean::next_id(db)?,
+    let (object_key, id) = match &previous {
+        Some(previous) => (previous.key, previous.id.clone()),
+        None => {
+            let key = crate::lean::next_key(db)?;
+            (key, crate::lean::encode_key(key as u64))
+        }
     };
     let link_target = is_reparse
         .then(|| fs::read_link(path).ok())
         .flatten()
         .and_then(|p| p.to_str().map(str::to_owned));
     let (folder, literal) = crate::lean::store_location(db, key, name, kind == "file")?;
-    db.prepare_cached("INSERT INTO objects(id,kind_code,path_literal,parent,name,path_folder,size,created,modified,changed,native_id,reparse,link_target)
+    db.prepare_cached("INSERT INTO objects(key,kind_code,path_literal,parent,name,path_folder,size,created,modified,changed,native_id,reparse,link_target)
         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
-        ON CONFLICT(id) DO UPDATE SET path_literal=?3,parent=?4,name=?5,path_folder=?6,size=?7,created=?8,modified=?9,
+        ON CONFLICT(key) DO UPDATE SET path_literal=?3,parent=?4,name=?5,path_folder=?6,size=?7,created=?8,modified=?9,
         changed=?10,native_id=coalesce(?11,native_id),reparse=?12,link_target=?13,revision=revision+?14,missing=0,
         hash=CASE WHEN ?14=1 THEN NULL ELSE hash END")?
-        .execute(params![id,i64::from(meta.is_dir()),literal,parent,name,folder,size,created,modified,native.changed,
+        .execute(params![object_key,i64::from(meta.is_dir()),literal,parent,name,folder,size,created,modified,native.changed,
             native.id.as_deref().map(fsmeta::pack_id),is_reparse,link_target,changed])?;
     if full_scan {
         db.prepare_cached("INSERT OR IGNORE INTO scan_present VALUES(?)")?

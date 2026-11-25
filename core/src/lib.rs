@@ -39,7 +39,7 @@ pub struct Mosh {
     actor: String,
 }
 
-const LEDGER_VERSION: i64 = 10;
+const LEDGER_VERSION: i64 = 11;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Object {
@@ -186,7 +186,11 @@ impl Mosh {
         nested::register(&db)?;
         db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA cache_size=-32768; PRAGMA temp_store=FILE;")?;
         let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version != LEDGER_VERSION {
+        ensure!(
+            (0..=LEDGER_VERSION).contains(&version),
+            "unsupported Ledger format {version}"
+        );
+        if version < 10 {
             let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let locked_version: i64 =
                 tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
@@ -227,8 +231,25 @@ impl Mosh {
                 tx.execute_batch(include_str!("ledger_v10.sql"))?;
                 metadata_search::rebuild(&tx)?;
             }
-            tx.pragma_update(None, "user_version", LEDGER_VERSION)?;
+            if locked_version < 10 {
+                tx.pragma_update(None, "user_version", 10)?;
+            }
             tx.commit()?;
+        }
+        if version < LEDGER_VERSION {
+            db.execute_batch("PRAGMA foreign_keys=OFF; PRAGMA legacy_alter_table=ON;")?;
+            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let current: i64 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
+            ensure!(
+                (10..=LEDGER_VERSION).contains(&current),
+                "unsupported Ledger format {current}"
+            );
+            if current == 10 {
+                lean::consolidate_keys(&tx)?;
+                tx.pragma_update(None, "user_version", LEDGER_VERSION)?;
+            }
+            tx.commit()?;
+            db.execute_batch("PRAGMA legacy_alter_table=OFF; PRAGMA foreign_keys=ON;")?;
         }
         ensure!(
             db.query_row(

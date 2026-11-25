@@ -6,7 +6,7 @@ Mosh is a local-first file explorer and searchable Ledger for Windows. It indexe
 
 Download the Windows x64 installer or CLI ZIP from [GitHub Releases](https://github.com/ConnorBache/Mosh/releases). The desktop application uses Microsoft Edge WebView2. The initial installer is unsigned. Compare its SHA-256 hash with the release checksum before running it.
 
-The published 0.2.0 preview uses Ledger format 8. Builds from this source tree use format 10 and upgrade earlier Ledgers on open. Back up your Ledger before upgrading. After upgrade, run `mosh ledger compact` to reclaim reusable pages. See the [preview release notes](docs/release-preview.md).
+The published 0.2.0 preview uses Ledger format 8. Builds from this source tree use format 11 and upgrade earlier Ledgers on open. Back up your Ledger before upgrading. After upgrade, run `mosh ledger compact` to reclaim reusable pages. See the [preview release notes](docs/release-preview.md).
 
 1. Open **Mosh** and choose **Index folder**. Select an ordinary directory.
 2. Browse the indexed folder. Double-click a folder to enter it or a file to open it with its Windows association. Select a row to inspect metadata, a text preview, tags, Paint, and available history.
@@ -35,7 +35,7 @@ For directory watching, keep the watch command running and use Ctrl+C to stop. M
 
 ## Information tiers and Ask Mosh
 
-Files have separate importance, information, and hotness scores. The default direct-tag minimums are **1 for T1, 5 for T2, 10 for T3, and 100 for T4**. Change these under **Settings → Information tiers**. T5 through T10 are inactive until configured. Inherited and suggested tags do not count. A file keeps its valid tags when its effective tier falls below its target. Inspect a file to see the reason, override the target, or request reassessment.
+Files have separate importance, information, and hotness scores. These guide the target tier. The effective tier depends on Individuality. The default floors are **0 for T1, 60 for T2, 80 for T3, and 90 for T4**. Files of at least 1, 16, and 128 MiB require an extra 10, 20, or 30 points respectively, capped at 100. Change the base floors under **Settings → Information tiers**. T5 through T10 are inactive until configured. Inspect a file to see the reason, override the target, or request reassessment. Defaults are computed on demand. Model assessments, overrides, locks, and access activity are saved.
 
 **Settings → AI providers and agents** configures Ollama, OpenAI, or an OpenAI-compatible endpoint. Ollama defaults to loopback. Choose models by role or use **Use detected models** to fill empty roles from the installed model list. Agent background work is opt-in. To run a local Ollama server with cloud features disabled, set `OLLAMA_NO_CLOUD=1` before starting it. Remote providers read keys from the process environment and require explicit opt-in, pricing, spending limits, and a source Coll permission before reading source content.
 
@@ -80,7 +80,7 @@ Older Ledgers migrate on open. The migration keeps their tags, aliases, confiden
 
 ## Individuality and vocabulary
 
-The **Individuality** tab and `mosh individuality <file>` compare distinct confirmed direct tags against a bounded set of permitted neighbors. Lower values indicate closer matches. Exact duplicates found by verified duplicate analysis appear separately. Scores use the current tag index when requested. Review quoted evidence before approving a proposed assignment. Tag merge and deletion require `--confirm`.
+The **Individuality** tab and `mosh individuality <file>` use confirmed direct tags as clues. The score estimates how many clues narrow the viewer's permitted scope to at most eight files and 32 KiB of estimated skim input. The estimate caps each file's skim at 8 KiB. A scope that already fits, or a shortlist found in one clue, gets 100. Each additional clue costs ten points. If the search cannot reach the budget with the tested clues, it scores zero. Nearest matches and verified duplicates remain visible as separate diagnostics. Review quoted evidence before approving a proposed assignment. Tag merge and deletion require `--confirm`.
 
 Search feedback evaluates a trial against the confirmed miss and up to 12 other labeled searches. The trial commits when the primary rank improves and the evaluated controls reproduce their baselines without losing rank. Its report in **Agents** includes rejected trials, metrics, and the proposed tags.
 
