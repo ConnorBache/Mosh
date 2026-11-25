@@ -1,11 +1,11 @@
-use crate::{Mosh, canonical, event, fsmeta, millis, now, path_text, prefix, uuid};
+use crate::{Mosh, canonical, event, fsmeta, now, path_text, prefix};
 use anyhow::{Context, Result, ensure};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::Serialize;
 use serde_json::json;
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
     sync::{
@@ -52,7 +52,7 @@ fn previous(row: &rusqlite::Row<'_>) -> rusqlite::Result<Previous> {
         id: row.get(0)?,
         path: row.get(1)?,
         kind: row.get(2)?,
-        native: row.get(3)?,
+        native: fsmeta::unpack_id(row.get_ref(3)?)?,
         created: row.get(4)?,
         modified: row.get(5)?,
         size: row.get(6)?,
@@ -63,16 +63,26 @@ fn previous(row: &rusqlite::Row<'_>) -> rusqlite::Result<Previous> {
 
 const STAMP: &str = "id,path,kind,native_id,created,modified,size,changed,reparse";
 
-fn forgotten(db: &Connection, path: &str, revision: Option<&str>) -> Result<u64> {
+fn forgotten(db: &Connection, path: &str, full_scan: bool) -> Result<u64> {
     let (low, high) = prefix(path);
+    let unseen = if full_scan {
+        "AND NOT EXISTS(SELECT 1 FROM scan_present WHERE scan_present.id=objects.id)"
+    } else {
+        ""
+    };
     let where_clause =
-        "missing=0 AND (path=?1 OR (path>=?2 AND path<?3)) AND (?4 IS NULL OR seen IS NOT ?4)";
-    db.execute(&format!("INSERT INTO audit(time,object,action,previous,outcome)
-        SELECT ?5,id,'external-missing',json_object('path',path,'modified',modified,'size',size),'observed'
-        FROM objects WHERE {where_clause}"),params![path,low,high,revision,now()])?;
+        format!("missing=0 AND path>=?1 AND path<?3 AND (path=?1 OR path>=?2) {unseen}");
+    db.execute(
+        &format!(
+            "INSERT INTO audit(time,object,action,previous,outcome)
+        SELECT ?4,id,'external-missing',json_object('path',path),'observed'
+        FROM objects WHERE {where_clause}"
+        ),
+        params![path, low, high, now()],
+    )?;
     Ok(db.execute(
         &format!("UPDATE objects SET missing=1 WHERE {where_clause}"),
-        params![path, low, high, revision],
+        params![path, low, high],
     )? as u64)
 }
 
@@ -99,14 +109,14 @@ fn identity(
         if existing.kind == kind && !birth_changed && !id_changed {
             return Ok(Some(existing));
         }
-        forgotten(db, path, None)?;
+        forgotten(db, path, false)?;
     }
     let Some((native, created)) = native.zip(created) else {
         return Ok(None);
     };
     let mut stmt = db.prepare_cached(&format!("SELECT {STAMP} FROM objects WHERE native_id=? AND created=? AND kind=? AND missing=0 LIMIT 3"))?;
     let candidates = stmt
-        .query_map(params![native, created, kind], previous)?
+        .query_map(params![fsmeta::pack_id(native), created, kind], previous)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     if candidates.len() != 1 {
         return Ok(None);
@@ -152,9 +162,8 @@ fn index_one(
     db: &Connection,
     tag_writer: &mut crate::packed_tags::Writer<'_>,
     path: &Path,
-    seen: &str,
+    full_scan: bool,
     actor: &str,
-    volumes: &mut HashMap<String, Option<String>>,
 ) -> Result<bool> {
     let meta = fs::symlink_metadata(path)?;
     let key = path_text(path)?;
@@ -169,9 +178,6 @@ fn index_one(
     } else {
         String::new()
     };
-    let mime = (!extension.is_empty())
-        .then(|| mime_guess::from_ext(&extension).first_raw())
-        .flatten();
     let parent = path
         .parent()
         .and_then(Path::to_str)
@@ -183,32 +189,12 @@ fn index_one(
         .transpose()?
         .flatten();
     let native = fsmeta::native(path, &meta);
-    let filesystem = native
-        .volume
-        .as_ref()
-        .and_then(|volume| {
-            volumes
-                .entry(volume.clone())
-                .or_insert_with(|| {
-                    #[cfg(windows)]
-                    {
-                        fsmeta::win::filesystem(path)
-                    }
-                    #[cfg(not(windows))]
-                    {
-                        None
-                    }
-                })
-                .clone()
-        })
-        .or(native.filesystem);
     let (size, modified, created) = fsmeta::revision_stamp(&meta);
     let size: i64 = if kind == "file" {
         i64::try_from(size).context("file size exceeds SQLite range")?
     } else {
         0
     };
-    let accessed = meta.accessed().ok().map(millis);
     let previous = identity(db, key, kind, native.id.as_deref(), created)?;
     let changed = previous.as_ref().is_none_or(|old| {
         old.size != size
@@ -218,20 +204,25 @@ fn index_one(
     });
     let renamed = previous.as_ref().is_some_and(|old| old.path != key);
     let new = previous.is_none();
-    let id = previous.as_ref().map(|p| p.id.clone()).unwrap_or_else(uuid);
+    let id = match &previous {
+        Some(previous) => previous.id.clone(),
+        None => crate::lean::next_id(db)?,
+    };
     let link_target = is_reparse
         .then(|| fs::read_link(path).ok())
         .flatten()
         .and_then(|p| p.to_str().map(str::to_owned));
-    db.prepare_cached("INSERT INTO objects(id,kind,path,parent,name,extension,mime,size,allocated,created,modified,accessed,changed,
-        attributes,native_id,volume,filesystem,hardlinks,reparse,link_target,seen)
-        VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)
-        ON CONFLICT(id) DO UPDATE SET path=?3,parent=?4,name=?5,extension=?6,mime=?7,size=?8,allocated=?9,created=?10,modified=?11,
-        accessed=?12,changed=?13,attributes=?14,native_id=coalesce(?15,native_id),volume=coalesce(?16,volume),filesystem=coalesce(?17,filesystem),
-        hardlinks=?18,reparse=?19,link_target=?20,seen=?21,revision=revision+?22,
-        hash=CASE WHEN ?22=1 THEN NULL ELSE hash END")?
-        .execute(params![id,kind,key,parent,name,extension,mime,size,native.allocated,created,modified,accessed,native.changed,
-            native.attributes,native.id,native.volume,filesystem,native.hardlinks,is_reparse,link_target,seen,changed])?;
+    db.prepare_cached("INSERT INTO objects(id,kind,path,parent,name,extension,size,created,modified,changed,native_id,reparse,link_target)
+        VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+        ON CONFLICT(id) DO UPDATE SET path=?3,parent=?4,name=?5,extension=?6,size=?7,created=?8,modified=?9,
+        changed=?10,native_id=coalesce(?11,native_id),reparse=?12,link_target=?13,revision=revision+?14,
+        hash=CASE WHEN ?14=1 THEN NULL ELSE hash END")?
+        .execute(params![id,kind,key,parent,name,extension,size,created,modified,native.changed,
+            native.id.as_deref().map(fsmeta::pack_id),is_reparse,link_target,changed])?;
+    if full_scan {
+        db.prepare_cached("INSERT OR IGNORE INTO scan_present VALUES(?)")?
+            .execute([&id])?;
+    }
     if new && kind == "coll" {
         db.prepare_cached("INSERT INTO owners VALUES(?,?)")?
             .execute(params![id, actor])?;
@@ -240,7 +231,7 @@ fn index_one(
             AND instr(substr(path,length(?2)+1),?4)=0")?.execute(params![id,low,high,std::path::MAIN_SEPARATOR_STR])?;
     }
     if new || renamed {
-        let ids = deterministic_tags(&extension, kind, mime)
+        let ids = deterministic_tags(&extension, kind, fsmeta::mime(Some(&extension)))
             .iter()
             .map(|name| crate::organization::dictionary_id(db, name))
             .collect::<Result<Vec<_>>>()?;
@@ -255,21 +246,15 @@ fn index_one(
         }
         crate::tiers::indexed(db, &id)?;
     }
-    if new || changed || renamed {
-        let before = previous.map(|old|json!({"path":old.path,"size":old.size,"modified":old.modified,"native_id":old.native}));
+    if renamed {
+        let before = previous.map(|old| json!({"path":old.path}));
         event(
             db,
             Some(&id),
-            if new {
-                "discovered"
-            } else if renamed {
-                "external-move"
-            } else {
-                "external-modified"
-            },
+            "external-move",
             None,
             before.as_ref(),
-            Some(&json!({"path":key,"size":size,"modified":modified,"native_id":native.id})),
+            Some(&json!({"path":key})),
             "observed",
         )?;
     }
@@ -317,9 +302,11 @@ impl Mosh {
 
     fn walk(&self, db: &Connection, root: &Path, cancel: &AtomicBool) -> Result<ScanReport> {
         let started = Instant::now();
-        let seen = uuid();
+        db.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS scan_present(id TEXT PRIMARY KEY) WITHOUT ROWID;
+            DELETE FROM scan_present;",
+        )?;
         let mut report = ScanReport::default();
-        let mut volumes = HashMap::new();
         let mut tag_writer = crate::packed_tags::Writer::new(db);
         let mut repos = BTreeSet::new();
         if let Some(repo) = crate::git::root(root) {
@@ -368,7 +355,7 @@ impl Mosh {
                     continue;
                 }
             }
-            match index_one(db, &mut tag_writer, path, &seen, &self.actor, &mut volumes) {
+            match index_one(db, &mut tag_writer, path, true, &self.actor) {
                 Ok(changed) => {
                     report.scanned += 1;
                     report.changed += u64::from(changed);
@@ -381,8 +368,9 @@ impl Mosh {
         }
         tag_writer.flush()?;
         if report.errors == 0 {
-            report.missing = forgotten(db, path_text(root)?, Some(&seen))?;
+            report.missing = forgotten(db, path_text(root)?, true)?;
         }
+        db.execute("DELETE FROM scan_present", [])?;
         for repo in repos {
             if let Err(error) = crate::git::refresh(db, &repo) {
                 report.warning(format!("Git {}: {error:#}", repo.display()));
@@ -450,14 +438,7 @@ impl Mosh {
             Ok(meta) if meta.is_dir() && !fsmeta::reparse(&meta) => self.walk(&tx, path, cancel)?,
             Ok(_) => {
                 let mut writer = crate::packed_tags::Writer::new(&tx);
-                let changed = index_one(
-                    &tx,
-                    &mut writer,
-                    path,
-                    &uuid(),
-                    &self.actor,
-                    &mut HashMap::new(),
-                )?;
+                let changed = index_one(&tx, &mut writer, path, false, &self.actor)?;
                 writer.flush()?;
                 if let Some(repo) = crate::git::root(path) {
                     crate::git::refresh(&tx, &repo)?;
@@ -470,7 +451,7 @@ impl Mosh {
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => ScanReport {
-                missing: forgotten(&tx, path_text(path)?, None)?,
+                missing: forgotten(&tx, path_text(path)?, false)?,
                 ..Default::default()
             },
             Err(error) => return Err(error.into()),

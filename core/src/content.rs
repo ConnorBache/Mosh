@@ -66,7 +66,7 @@ pub fn register(db: &Connection) -> Result<()> {
     db.create_scalar_function("mosh_live_match",5,FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DIRECTONLY,move |ctx| {
         let path=ctx.get::<String>(0)?;
         let extension=ctx.get::<String>(1)?;
-        let native=ctx.get::<Option<String>>(2)?;
+        let native=fsmeta::unpack_id(ctx.get_raw(2))?;
         let created=ctx.get::<Option<i64>>(3)?;
         let term=ctx.get::<String>(4)?;
         let Some(text)=extract(&path,&extension,native.as_deref(),created) else { return Ok(false); };
@@ -155,7 +155,7 @@ impl Mosh {
                         r.get::<_, i64>(0)?,
                         r.get::<_, String>(1)?,
                         r.get::<_, String>(2)?,
-                        r.get::<_, Option<String>>(3)?,
+                        fsmeta::unpack_id(r.get_ref(3)?)?,
                         r.get::<_, Option<i64>>(4)?,
                     ))
                 })?

@@ -1,4 +1,9 @@
 use crate::millis;
+use rusqlite::{
+    Connection,
+    functions::FunctionFlags,
+    types::{Value, ValueRef},
+};
 use std::{
     fs::{self, File, Metadata},
     io::{Read, Seek, SeekFrom},
@@ -9,7 +14,6 @@ use std::{
 pub(crate) struct Native {
     pub id: Option<String>,
     pub volume: Option<String>,
-    pub filesystem: Option<String>,
     pub allocated: Option<i64>,
     pub changed: Option<i64>,
     pub hardlinks: Option<i64>,
@@ -60,9 +64,9 @@ pub(crate) mod win {
         }
     }
 
-    pub(super) fn read_native(path: &Path, meta: &Metadata) -> Native {
+    pub(super) fn read_native(path: &Path, meta: &Metadata, details: bool) -> Native {
         let mut result = Native {
-            attributes: Some(meta.file_attributes()),
+            attributes: details.then(|| meta.file_attributes()),
             ..Default::default()
         };
         let Ok(file) = attr_file(path, 0) else {
@@ -73,10 +77,10 @@ pub(crate) mod win {
             let key = u128::from_le_bytes(id.FileId.Identifier);
             if key != 0 {
                 result.id = Some(format!("{:016x}:{key:032x}", id.VolumeSerialNumber));
-                result.volume = Some(format!("{:016x}", id.VolumeSerialNumber));
+                result.volume = details.then(|| format!("{:016x}", id.VolumeSerialNumber));
             }
         }
-        if let Some(info) = read_info::<FILE_STANDARD_INFO>(handle, FileStandardInfo) {
+        if details && let Some(info) = read_info::<FILE_STANDARD_INFO>(handle, FileStandardInfo) {
             result.allocated = Some(info.AllocationSize);
             result.hardlinks = Some(i64::from(info.NumberOfLinks));
         }
@@ -170,7 +174,7 @@ pub(crate) mod win {
 
 #[cfg(windows)]
 pub(crate) fn native(path: &Path, meta: &Metadata) -> Native {
-    win::read_native(path, meta)
+    win::read_native(path, meta, false)
 }
 #[cfg(windows)]
 pub(crate) fn security(path: &Path) -> serde_json::Value {
@@ -183,22 +187,140 @@ pub(crate) fn security(_path: &Path) -> serde_json::Value {
 
 #[cfg(unix)]
 pub(crate) fn native(_path: &Path, meta: &Metadata) -> Native {
+    unix_native(meta, false)
+}
+
+#[cfg(unix)]
+fn unix_native(meta: &Metadata, details: bool) -> Native {
     use std::os::unix::fs::MetadataExt;
     Native {
         id: Some(format!("{}:{}", meta.dev(), meta.ino())),
-        volume: Some(meta.dev().to_string()),
-        allocated: meta
-            .blocks()
-            .checked_mul(512)
-            .and_then(|n| i64::try_from(n).ok()),
+        volume: details.then(|| meta.dev().to_string()),
+        allocated: details
+            .then(|| {
+                meta.blocks()
+                    .checked_mul(512)
+                    .and_then(|n| i64::try_from(n).ok())
+            })
+            .flatten(),
         changed: meta
             .ctime()
             .checked_mul(1000)
             .map(|n| n + meta.ctime_nsec() / 1_000_000),
-        hardlinks: i64::try_from(meta.nlink()).ok(),
-        attributes: Some(meta.mode()),
-        filesystem: None,
+        hardlinks: details.then(|| i64::try_from(meta.nlink()).ok()).flatten(),
+        attributes: details.then(|| meta.mode()),
     }
+}
+
+pub(crate) fn pack_id(id: &str) -> Value {
+    if let Some((volume, file)) = id.split_once(':')
+        && volume.len() == 16
+        && file.len() == 32
+        && let (Ok(volume), Ok(file)) = (
+            u64::from_str_radix(volume, 16),
+            u128::from_str_radix(file, 16),
+        )
+    {
+        let mut packed = Vec::with_capacity(24);
+        packed.extend(volume.to_be_bytes());
+        if let Ok(file) = u64::try_from(file) {
+            packed.extend(file.to_be_bytes());
+        } else {
+            packed.extend(file.to_be_bytes());
+        }
+        return Value::Blob(packed);
+    }
+    Value::Text(id.to_owned())
+}
+
+pub(crate) fn unpack_id(value: ValueRef<'_>) -> rusqlite::Result<Option<String>> {
+    match value {
+        ValueRef::Null => Ok(None),
+        ValueRef::Text(text) => Ok(Some(String::from_utf8_lossy(text).into_owned())),
+        ValueRef::Blob(bytes) if matches!(bytes.len(), 16 | 24) => {
+            let volume = u64::from_be_bytes(bytes[..8].try_into().unwrap());
+            let file = if bytes.len() == 16 {
+                u128::from(u64::from_be_bytes(bytes[8..].try_into().unwrap()))
+            } else {
+                u128::from_be_bytes(bytes[8..].try_into().unwrap())
+            };
+            Ok(Some(format!("{volume:016x}:{file:032x}")))
+        }
+        _ => Err(rusqlite::Error::InvalidQuery),
+    }
+}
+
+pub(crate) fn mime(extension: Option<&str>) -> Option<&'static str> {
+    extension.and_then(|extension| mime_guess::from_ext(extension).first_raw())
+}
+
+fn live(
+    path: &Path,
+    id: Option<&str>,
+    created: Option<i64>,
+    link: bool,
+) -> Option<(Metadata, Native)> {
+    let meta = fs::symlink_metadata(path).ok()?;
+    if reparse(&meta) != link
+        || crate::indexed_path(path).ok()?.as_path() != path
+        || created.is_some_and(|expected| meta.created().ok().map(millis) != Some(expected))
+    {
+        return None;
+    }
+    #[cfg(windows)]
+    let native = win::read_native(path, &meta, true);
+    #[cfg(unix)]
+    let native = unix_native(&meta, true);
+    if id.is_some_and(|expected| native.id.as_deref() != Some(expected)) {
+        return None;
+    }
+    Some((meta, native))
+}
+
+pub(crate) fn populate(object: &mut crate::Object) {
+    let Some(path) = object.path.as_deref().map(Path::new) else {
+        return;
+    };
+    let Some((meta, native)) = live(
+        path,
+        object.native_id.as_deref(),
+        object.created,
+        object.reparse,
+    ) else {
+        return;
+    };
+    object.accessed = meta.accessed().ok().map(millis);
+    object.allocated = native.allocated;
+    object.attributes = native.attributes;
+    object.volume = native.volume;
+    object.hardlinks = native.hardlinks;
+    #[cfg(windows)]
+    {
+        object.filesystem = win::filesystem(path);
+    }
+}
+
+pub(crate) fn register(db: &Connection) -> rusqlite::Result<()> {
+    db.create_scalar_function(
+        "mosh_mime",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| Ok(mime(ctx.get::<Option<String>>(0)?.as_deref())),
+    )?;
+    db.create_scalar_function(
+        "mosh_live_allocated",
+        4,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DIRECTONLY,
+        |ctx| {
+            let path: Option<String> = ctx.get(0)?;
+            let id = unpack_id(ctx.get_raw(1))?;
+            let created = ctx.get(2)?;
+            let link = ctx.get(3)?;
+            Ok(path
+                .and_then(|path| live(Path::new(&path), id.as_deref(), created, link))
+                .and_then(|(_, native)| native.allocated))
+        },
+    )
 }
 
 pub(crate) fn revision_stamp(meta: &Metadata) -> (u64, Option<i64>, Option<i64>) {

@@ -459,7 +459,13 @@ impl Mosh {
             )
             .optional()?
             .context("plan not found")?;
-        Ok((serde_json::from_str(&manifest)?, state))
+        let mut manifest: Manifest = serde_json::from_str(&manifest)?;
+        for entry in &mut manifest.entries {
+            if let Some(id) = crate::lean::resolve(&self.db, &entry.object)? {
+                entry.object = id;
+            }
+        }
+        Ok((manifest, state))
     }
 
     pub fn plan_status(&self, id: &str) -> Result<Value> {
@@ -550,7 +556,7 @@ impl Mosh {
         let mut writer = crate::packed_tags::Writer::new(&tx);
         let mut affected = Vec::new();
         if plan.action == Action::Marriage {
-            let id = uuid();
+            let id = crate::lean::next_id(&tx)?;
             tx.execute(
                 "INSERT INTO objects(id,kind,name) VALUES(?,'marriage',?)",
                 params![id, plan.argument],

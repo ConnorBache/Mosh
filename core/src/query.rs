@@ -215,7 +215,12 @@ impl Parser {
                     format!("({readable} AND o.id IN({direct}))")
                 }
             }
-            "id" => format!("o.id={}", self.bind(value.to_owned())),
+            "id" => {
+                let id = self.bind(value.to_owned());
+                format!(
+                    "(o.id={id} OR o.id=(SELECT object FROM legacy_object_ids WHERE alias=mosh_legacy_id({id})))"
+                )
+            }
             "name" => format!("o.name={} COLLATE NOCASE", self.bind(value.to_owned())),
             "name-contains" => format!(
                 "instr(lower(o.name),lower({}))>0",
@@ -252,9 +257,10 @@ impl Parser {
             "type" | "mime" => {
                 let value = value.trim_end_matches('*');
                 let id = self.bind(value.to_owned());
+                let mime = "coalesce(o.mime,mosh_mime(o.extension))";
                 format!(
-                    "(o.mime={id} OR (substr(o.mime,1,length({id}))={id} AND
-                    (substr(o.mime,length({id})+1,1)='/' OR substr({id},-1)='/')))"
+                    "({mime}={id} OR (substr({mime},1,length({id}))={id} AND
+                    (substr({mime},length({id})+1,1)='/' OR substr({id},-1)='/')))"
                 )
             }
             "in" => {
@@ -279,9 +285,16 @@ impl Parser {
                     format!("o.{column}{op}{}", self.bind(date(value)?))
                 }
             }
-            "size" | "allocated" => {
+            "size" => {
                 let (op, value) = comparison(value);
-                format!("o.{field}{op}{}", self.bind(bytes(value)?))
+                format!("o.size{op}{}", self.bind(bytes(value)?))
+            }
+            "allocated" => {
+                let (op, value) = comparison(value);
+                let readable = crate::security::allowed("paint");
+                format!("CASE WHEN o.missing=0 AND {VISIBLE} AND {readable}
+                    THEN mosh_live_allocated(o.path,o.native_id,o.created,o.reparse){op}{} ELSE 0 END",
+                    self.bind(bytes(value)?))
             }
             "duplicate" => {
                 ensure!(
@@ -317,7 +330,8 @@ impl Parser {
             ),
             "marriage" | "logical-parent" => {
                 let collection = format!(
-                    "SELECT c.id FROM objects c WHERE c.missing=0 AND (c.id=?VALUE OR c.name=?VALUE COLLATE NOCASE) AND {}",
+                    "SELECT c.id FROM objects c WHERE c.missing=0 AND (c.id=?VALUE OR c.name=?VALUE COLLATE NOCASE
+                     OR c.id=(SELECT object FROM legacy_object_ids WHERE alias=mosh_legacy_id(?VALUE))) AND {}",
                     VISIBLE.replace("o.id", "c.id").replace("o.path", "c.path")
                 );
                 let collection = collection.replace("?VALUE", &self.bind(value.to_owned()));
@@ -511,7 +525,7 @@ impl Mosh {
         };
         let mut scope = String::new();
         if let Some(parent) = &options.parent {
-            let selected = self.get(parent)?;
+            let selected = self.find(parent)?;
             let id = parser.bind(selected.id.clone());
             scope = format!(
                 "AND (o.parent={id} OR o.id IN(SELECT target FROM edges WHERE container={id} AND kind<>'related')"

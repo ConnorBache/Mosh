@@ -1,4 +1,4 @@
-use crate::{Mosh, Object, event, object, packed_tags, uuid};
+use crate::{Mosh, Object, event, object, packed_tags};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
@@ -111,7 +111,7 @@ impl Mosh {
     }
 
     pub fn access(&self, reference: &str, person: &str, permission: &str) -> Result<()> {
-        let item = self.get(reference)?;
+        let item = self.find(reference)?;
         ensure!(
             item.kind != "file" && self.can_manage(&item)?,
             "Coll owner authority required"
@@ -155,7 +155,7 @@ impl Mosh {
     }
 
     pub fn secret(&self, reference: &str, enabled: bool) -> Result<()> {
-        let item = self.get(reference)?;
+        let item = self.find(reference)?;
         ensure!(
             item.kind != "file" && self.owns(&item.id)?,
             "Coll owner authority required"
@@ -168,7 +168,7 @@ impl Mosh {
     }
 
     pub fn tags(&self, reference: &str) -> Result<Vec<Value>> {
-        let selected = self.get(reference)?;
+        let selected = self.find(reference)?;
         if !self.permits(&selected, "paint")? {
             return Ok(vec![]);
         }
@@ -199,7 +199,7 @@ impl Mosh {
     }
 
     pub fn tag(&self, reference: &str, name: &str, add: bool, confidence: f64) -> Result<()> {
-        let selected = self.get(reference)?;
+        let selected = self.find(reference)?;
         self.editable(&selected)?;
         let tx = rusqlite::Transaction::new_unchecked(
             &self.db,
@@ -383,7 +383,7 @@ impl Mosh {
     }
 
     pub fn paint(&self, reference: &str) -> Result<Option<Value>> {
-        let selected = self.get(reference)?;
+        let selected = self.find(reference)?;
         if !self.permits(&selected, "paint")? {
             return Ok(None);
         }
@@ -395,7 +395,7 @@ impl Mosh {
     }
 
     pub fn set_paint(&self, reference: &str, level: &str, body: &str, locked: bool) -> Result<()> {
-        let selected = self.get(reference)?;
+        let selected = self.find(reference)?;
         self.editable(&selected)?;
         ensure!(
             body.len() <= 32768 && matches!(level, "none" | "minimal" | "standard" | "detailed"),
@@ -428,8 +428,11 @@ impl Mosh {
             !name.trim().is_empty() && name.len() <= 240,
             "a collection name is required"
         );
-        let tx = self.db.unchecked_transaction()?;
-        let id = uuid();
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let id = crate::lean::next_id(&tx)?;
         tx.execute(
             "INSERT INTO objects(id,kind,name) VALUES(?,?,?)",
             params![id, if marriage { "marriage" } else { "coll" }, name.trim()],
@@ -455,8 +458,8 @@ impl Mosh {
         kind: &str,
         selector: Option<&str>,
     ) -> Result<()> {
-        let container = self.get(container)?;
-        let target = self.get(target)?;
+        let container = self.find(container)?;
+        let target = self.find(target)?;
         self.editable(&container)?;
         ensure!(
             matches!(kind, "parent" | "reference" | "related")
@@ -492,7 +495,7 @@ impl Mosh {
     }
 
     pub fn collection_query(&self, container: &str, query: &str) -> Result<()> {
-        let selected = self.get(container)?;
+        let selected = self.find(container)?;
         self.editable(&selected)?;
         ensure!(
             selected.kind == "marriage",
@@ -508,7 +511,7 @@ impl Mosh {
 
     pub fn graph(&self, reference: Option<&str>) -> Result<Vec<Value>> {
         let id = reference
-            .map(|reference| self.get(reference).map(|object| object.id))
+            .map(|reference| self.find(reference).map(|object| object.id))
             .transpose()?;
         let sql = format!(
             "{AUTHORITY} SELECT o.*,e.kind AS edge_kind,e.selector,e.container AS source
@@ -531,7 +534,7 @@ impl Mosh {
         let mut result = Vec::new();
         for record in records {
             let (target, source, kind, selector) = record?;
-            if let Ok(source) = self.get(&source) {
+            if let Ok(source) = self.find(&source) {
                 result
                     .push(json!({"source":source,"target":target,"kind":kind,"selector":selector}));
             }

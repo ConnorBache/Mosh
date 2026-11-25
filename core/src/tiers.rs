@@ -467,7 +467,9 @@ mod scale_test {
     #[test]
     #[ignore = "creates a temporary million-row metadata Ledger without physical files"]
     fn million_record_metadata() -> Result<()> {
-        let temporary = tempfile::tempdir()?;
+        let temporary = tempfile::Builder::new()
+            .prefix("mosh-metadata-scale-")
+            .tempdir()?;
         let path = temporary.path().join("scale.sqlite3");
         let baseline_started = Instant::now();
         let mut baseline = Connection::open(&path)?;
@@ -532,7 +534,8 @@ mod scale_test {
             .db
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
         let migration_time = migration.elapsed();
-        let v3_bytes = fs::metadata(&path)?.len();
+        let current_bytes = fs::metadata(&path)?.len();
+        let current_id = ledger.get("file-1000000")?.id;
         let count: u64 = ledger.db.query_row(
             "SELECT count(*) FROM file_tiers WHERE effective=1",
             [],
@@ -546,9 +549,9 @@ mod scale_test {
         let start = Instant::now();
         for _ in 0..30 {
             let id: String = query.query_row([], |r| r.get(0))?;
-            assert_eq!(id, "file-1000000");
+            assert_eq!(id, current_id);
         }
-        let v3_mean_ms = start.elapsed().as_secs_f64() * 1000.0 / 30.0;
+        let current_mean_ms = start.elapsed().as_secs_f64() * 1000.0 / 30.0;
         let intersect = Instant::now();
         let result = ledger.search(
             indexed,
@@ -557,10 +560,10 @@ mod scale_test {
                 ..Default::default()
             },
         )?;
-        assert_eq!(result[0].id, "file-1000000");
+        assert_eq!(result[0].id, current_id);
         let intersection_ms = intersect.elapsed().as_secs_f64() * 1000.0;
         println!(
-            "million metadata rows: base {baseline_time:.2?}, v3 migration {migration_time:.2?}, bytes {baseline_bytes} -> {v3_bytes}; warm FTS (30) {v2_mean_ms:.4} -> {v3_mean_ms:.4} ms; two-tag intersection {intersection_ms:.2} ms"
+            "million metadata rows: base {baseline_time:.2?}, migration {migration_time:.2?}, bytes {baseline_bytes} -> {current_bytes}; warm FTS (30) {v2_mean_ms:.4} -> {current_mean_ms:.4} ms; two-tag intersection {intersection_ms:.2} ms"
         );
         Ok(())
     }

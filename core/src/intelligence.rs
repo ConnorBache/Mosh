@@ -389,7 +389,7 @@ impl Mosh {
             .db
             .prepare_cached("SELECT object FROM object_keys WHERE key=?")?
             .query_row([key], |r| r.get(0))?;
-        self.get(&id)
+        self.find(&id)
     }
 
     pub fn run_agents(&self, count: usize, cancel: &AtomicBool) -> Result<Value> {
@@ -658,7 +658,7 @@ impl Mosh {
             )?,
             "worker lease was lost"
         );
-        let current = self.get(&item.id)?;
+        let current = self.find(&item.id)?;
         if current.revision != item.revision {
             return Ok(json!({"obsolete":true}));
         }
@@ -1398,7 +1398,7 @@ impl Mosh {
         let mut inspected = 0;
         let reading = Instant::now();
         for (id, (_, reasons, passage)) in ranked.into_iter().take(cfg.max_candidates) {
-            let Ok(object) = self.get(&id) else {
+            let Ok(object) = self.find(&id) else {
                 continue;
             };
             if !self.permits(&object, "content")? {
@@ -1558,7 +1558,14 @@ impl Mosh {
                 .position(|id| id.as_str() == Some(&object.id))
                 .map(|r| r + 1)
         };
-        let prior_ids: Vec<Value> = serde_json::from_str(&prior)?;
+        let mut prior_ids: Vec<Value> = serde_json::from_str(&prior)?;
+        for id in &mut prior_ids {
+            if let Some(old) = id.as_str()
+                && let Some(current) = crate::lean::resolve(&self.db, old)?
+            {
+                *id = json!(current);
+            }
+        }
         let baseline = rank(&prior_ids);
         let enrichment = if baseline != Some(1) {
             self.process_job(

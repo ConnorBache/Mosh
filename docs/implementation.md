@@ -25,6 +25,7 @@
 - [x] Compile validated search branches to parameterized queries. Search with positive intersections, scoped relationships, cached text, name, Paint, and vector similarity where applicable.
 - [x] Capture search feedback and replay a confirmed miss. Expose tier, model, agent, and search settings in desktop and CLI.
 - [x] Measure the million-record migration and retrieval paths. Exercise real local embeddings and evaluate a small generation model.
+- [x] Reduce filesystem duplication with compact IDs, live inspection details, and lean scan history. Measure a fresh Ledger and an upgraded Ledger on the same files.
 - [ ] Verify real-model semantic tagging and planning quality across tiers. Verify adaptive depth, multi-perspective high-tier evaluation, and a larger annotated retrieval dataset.
 - [ ] Add automatic Ollama installation, an OS credential-vault UI, and end-to-end OpenAI verification with real account credentials. Existing local models can already be detected and selected from Settings.
 - [ ] Add a scalable approximate/partitioned vector index and compare alternatives. The current permission-filtered int8 similarity pass scans the configured model's eligible vectors. Add virtual-collection and Marriage embedding refresh on membership changes.

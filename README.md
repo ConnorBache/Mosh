@@ -6,7 +6,7 @@ Mosh is a local-first file explorer and searchable Ledger for Windows. It indexe
 
 Download the Windows x64 installer or CLI ZIP from [GitHub Releases](https://github.com/ConnorBache/Mosh/releases). The desktop application uses Microsoft Edge WebView2. The initial installer is unsigned. Compare its SHA-256 hash with the release checksum before running it.
 
-The published v0.1.0 preview uses Ledger format 1. Building from current source adds packed tags, the optional content cache, and the Ledger format 3 intelligence features. Back up your Ledger before opening it with the newer build.
+The published v0.1.0 preview uses Ledger format 1. Building from current source uses Ledger format 4 with compact file identifiers, packed tags, the optional content cache, and intelligence features. Back up your Ledger before opening it with the newer build.
 
 1. Open **Mosh** and choose **Index folder**. Select an ordinary directory.
 2. Browse the indexed folder. Double-click a folder to enter it or a file to open it with its Windows association. Select a row to inspect metadata, a text preview, tags, Paint, and available history.
@@ -76,7 +76,7 @@ The Ledger stores packed tag sets and reverse lookups. Identical tag sets share 
 
 The optional content cache stores searchable terms and positions up to the requested number of SQLite page bytes. It invalidates entries after Mosh observes file changes. Run the same command to rebuild it or pass zero to clear it. `doctor` reports the database size, reusable pages, tag storage, and cache sizes. The write-ahead log and temporary SQLite work files can use additional disk space during writes.
 
-Format 1 and 2 Ledgers migrate on open. The migration preserves UUIDs, tag origins, aliases, confidence, evidence, Paint, and history. Format 1's extracted-text cache is rebuilt on demand. Format 3 gives existing files an initial tier and carries dictionary IDs forward into the Tag Registry. Run `mosh ledger compact` to return reusable pages to the filesystem after an upgrade or cache clear. Keep a backup and allow temporary disk space for compaction.
+Format 1 through 3 Ledgers migrate on open. The migration keeps their tags, aliases, confidence, evidence, Paint, relationships, and history. Existing UUIDs resolve as aliases for compact IDs. Format 1's extracted-text cache is rebuilt on demand. Format 3 gives existing files an initial tier and carries dictionary IDs forward into the Tag Registry. Run `mosh ledger compact` to return reusable pages to the filesystem after an upgrade or cache clear. Keep a backup and allow temporary disk space for compaction.
 
 ## Safety and recovery
 

@@ -3,6 +3,7 @@ mod content;
 mod fsmeta;
 mod git;
 mod intelligence;
+mod lean;
 pub mod models;
 mod operations;
 mod organization;
@@ -35,7 +36,7 @@ pub struct Mosh {
     actor: String,
 }
 
-const LEDGER_VERSION: i64 = 3;
+const LEDGER_VERSION: i64 = 4;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Object {
@@ -68,14 +69,17 @@ pub struct Object {
 }
 
 fn object(row: &Row<'_>) -> rusqlite::Result<Object> {
+    let extension: Option<String> = row.get("extension")?;
+    let mime: Option<String> = row.get("mime")?;
+    let mime = mime.or_else(|| fsmeta::mime(extension.as_deref()).map(str::to_owned));
     Ok(Object {
         id: row.get("id")?,
         kind: row.get("kind")?,
         path: row.get("path")?,
         parent: row.get("parent")?,
         name: row.get("name")?,
-        extension: row.get("extension")?,
-        mime: row.get("mime")?,
+        extension,
+        mime,
         size: row.get("size")?,
         allocated: row.get("allocated")?,
         created: row.get("created")?,
@@ -83,7 +87,7 @@ fn object(row: &Row<'_>) -> rusqlite::Result<Object> {
         accessed: row.get("accessed")?,
         changed: row.get("changed")?,
         attributes: row.get("attributes")?,
-        native_id: row.get("native_id")?,
+        native_id: fsmeta::unpack_id(row.get_ref("native_id")?)?,
         volume: row.get("volume")?,
         filesystem: row.get("filesystem")?,
         hardlinks: row.get("hardlinks")?,
@@ -173,6 +177,8 @@ impl Mosh {
         db.busy_timeout(Duration::from_secs(15))?;
         packed_tags::register(&db)?;
         content::register(&db)?;
+        lean::register(&db)?;
+        fsmeta::register(&db)?;
         db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA cache_size=-32768; PRAGMA temp_store=FILE;")?;
         let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
         if version != LEDGER_VERSION {
@@ -192,6 +198,9 @@ impl Mosh {
             }
             if locked_version < 3 {
                 tiers::migrate(&tx)?;
+            }
+            if locked_version < 4 {
+                lean::migrate(&tx)?;
                 tx.pragma_update(None, "user_version", LEDGER_VERSION)?;
             }
             tx.commit()?;
@@ -222,14 +231,26 @@ impl Mosh {
         Ok(())
     }
     pub fn get(&self, reference: &str) -> Result<Object> {
-        let by_id = self
-            .db
-            .query_row(
-                "SELECT * FROM objects WHERE id=? AND missing=0",
-                [reference],
-                object,
-            )
-            .optional()?;
+        let mut selected = self.find(reference)?;
+        if self.permits(&selected, "paint")? {
+            fsmeta::populate(&mut selected);
+        }
+        Ok(selected)
+    }
+
+    pub(crate) fn find(&self, reference: &str) -> Result<Object> {
+        let by_key = |key: &str| {
+            self.db
+                .prepare_cached("SELECT * FROM objects WHERE id=? AND missing=0")?
+                .query_row([key], object)
+                .optional()
+        };
+        let mut by_id = by_key(reference)?;
+        if by_id.is_none()
+            && let Some(alias) = lean::resolve(&self.db, reference)?
+        {
+            by_id = by_key(&alias)?;
+        }
         let selected = match by_id {
             Some(selected) => Some(selected),
             None => {
@@ -255,7 +276,7 @@ impl Mosh {
         let mut roots = Vec::new();
         for path in query.query_map([], |row| row.get::<_, String>(0))? {
             let path = path?;
-            if self.get(&path).is_ok() {
+            if self.find(&path).is_ok() {
                 roots.push(path);
             }
         }

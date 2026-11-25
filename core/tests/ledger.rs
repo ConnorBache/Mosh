@@ -551,5 +551,20 @@ fn records_authentic_windows_file_metadata() -> Result<()> {
     assert!(object.attributes.is_some());
     assert_eq!(object.hardlinks, Some(1));
     assert!(fixture.mosh.inspect(&object.id)?["windows_security"]["sddl"].is_string());
+    assert!(object.id.starts_with('@') && object.id.len() < 6);
+    assert_eq!(fixture.search("allocated:>=0 ext:txt")?, ["win.txt"]);
+    assert_eq!(fixture.search("mime:text/plain")?, ["win.txt"]);
+    let raw = rusqlite::Connection::open(&fixture.db)?;
+    let stored: (String, i64, bool) = raw.query_row(
+        "SELECT typeof(native_id), length(native_id),
+            allocated IS NULL AND volume IS NULL AND attributes IS NULL AND mime IS NULL
+            FROM objects WHERE id=?",
+        [&object.id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    assert_eq!(stored.0, "blob");
+    assert!(matches!(stored.1, 16 | 24));
+    assert!(stored.2);
+    assert!(fixture.mosh.history(Some(&object.id), 20)?.is_empty());
     Ok(())
 }

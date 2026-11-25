@@ -4,15 +4,15 @@ The Rust core owns indexing, search, collection rules, storage analysis, and nat
 
 ## Ledger
 
-SQLite uses foreign keys, WAL, transactional schema initialization, a bounded page cache, and an append-only audit table. A physical path, logical UUID, native volume and file ID, and creation timestamp serve different purposes. A verified Mosh move preserves the UUID. An external rename keeps it only when a unique live candidate has the same native identity and creation timestamp and its old path is gone. Hardlinks retain separate path records with a shared native identity.
+SQLite uses foreign keys, WAL, transactional schema initialization, a bounded page cache, and an append-only audit table. The filesystem manages the actual files. Mosh stores a compact identifier, a searchable path, and the change stamp used to refresh tags and text. It stores Windows volume and file identity in a 16- or 24-byte binary record. A verified Mosh move preserves the Ledger identifier. An external rename preserves it when a unique live candidate has the same native identity and creation timestamp and its old path is gone. Hardlinks retain separate path records with a shared native identity.
 
-The scan walks directories without following junctions or symlinks. Metadata and deterministic tags enter a single write transaction. Readers can use the previous snapshot while scanning. Cancellation rolls the transaction back. When a walk reports filesystem errors, the scan retains old records that may simply have become inaccessible. Watch mode batches Windows directory notifications, targets changed paths, and reconciles on event loss.
+The scan walks directories without following junctions or symlinks. The change stamp and deterministic tags enter a single write transaction. A temporary seen set reconciles missing paths. Ordinary discoveries and content edits update the index directly. Moves, missing paths, and Mosh actions can still leave history. Readers can use the previous snapshot while scanning. Cancellation rolls the transaction back. When a walk reports filesystem errors, the scan retains old records that may simply have become inaccessible. Watch mode batches Windows directory notifications, targets changed paths, and reconciles on event loss.
 
-The Ledger indexes names, paths, and Paint without duplicating their text into the FTS5 tables. Previews open the current file on demand. Content searches use the optional byte-budgeted FTS5 cache and read uncached files with the same phrase tokenizer. Scans invalidate outdated cache entries.
+The Ledger indexes names, paths, and Paint without duplicating their text into the FTS5 tables. Previews open the current file on demand. Inspection and allocated-space queries read live filesystem metadata. MIME types are derived from extensions. Content searches use the optional byte-budgeted FTS5 cache and read uncached files with the same phrase tokenizer. Scans invalidate outdated cache entries.
 
 ## Packed tags
 
-The object registry assigns durable integer keys for packed lookups. The existing UUID continues to identify objects in API calls and operations. Names and aliases resolve through the global tag dictionary.
+The object registry assigns durable integer keys for packed lookups. The API uses a short, Ledger-local base-62 spelling of the key. Previously issued UUIDs remain usable through a compact alias table. Tag names and aliases resolve through the global tag dictionary.
 
 Identical tag sets share an immutable packed record. Mosh chooses among gap-encoded IDs and runs of consecutive IDs. Origin flags retain independent sources and can share a default value for the set. Confidence and evidence departures from the defaults occupy a sparse table.
 

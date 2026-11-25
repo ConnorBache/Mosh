@@ -15,14 +15,14 @@ fn limit(payload: &Value) -> usize {
 
 impl Mosh {
     pub fn preview(&self, reference: &str) -> Result<String> {
-        let item = self.get(reference)?;
+        let item = self.find(reference)?;
         self.require_contents(&item)?;
         Ok(crate::content::preview(&item))
     }
 
     pub fn open_in_system(&self, reference: &str) -> Result<()> {
         self.admin()?;
-        let item = self.get(reference)?;
+        let item = self.find(reference)?;
         let path = Path::new(
             item.path
                 .as_deref()

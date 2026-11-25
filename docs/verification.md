@@ -55,3 +55,17 @@ cargo test --locked --release million_record_metadata -- --ignored --nocapture
 $env:MOSH_OLLAMA_TEST_URL = 'http://127.0.0.1:11434'
 cargo test --locked --release real_ollama_integration -- --ignored --nocapture
 ~~~
+
+## Ledger format 4 storage
+
+The same 10,000 generated C files on Windows NTFS were scanned with the preceding format 3 build and the format 4 build. Both measurements use the primary SQLite file after compaction, including directory records and indexes. The denominator is the number of regular source files.
+
+- The format 3 baseline used 15,339,520 bytes, or **1,534 bytes per file**. A fresh format 4 Ledger used 6,656,000 bytes, or **666 bytes per file**, including the default filesystem tags and file tiers. The reduction was 56.6%.
+- A fresh format 4 Ledger with **100 total direct tags** per file used 8,806,400 bytes, or **881 bytes per file**. With **1,000 total direct tags**, it used 15,622,144 bytes, or **1,562 bytes per file**. These runs use the same synthetic vocabulary and packed tag writer as the kernel test.
+- The test upgrade from format 3 used 9,895,936 bytes after compaction, or **990 bytes per file**. It retained the existing audit log plus 270,336 bytes of legacy ID aliases. The test verified the old UUID lookup, a user tag, discovery history, and Ledger integrity.
+- The audit table and its index fell from 3,723,264 bytes to 8,192 bytes on the fresh scan. Object records and their lookup indexes fell from 9,744,384 to 4,780,032 bytes. Filename and path search used 974,848 bytes in each fresh scan.
+- The separate one-million-record metadata fixture migrated from format 2 through format 4 in 47.90 seconds and preserved the expected packed-tag intersection and legacy ID lookup.
+
+Source text caching, embedding, and AI enrichment were disabled. The benchmark used small synthetic contents to exercise normal filesystem scanning and measures bytes per file. Its ratio to source bytes depends on typical file size. The first scan took 5.38 seconds with format 3 and 10.18 seconds with format 4 in this run. Allocated-space queries now read live filesystem details and may take longer across broad selections.
+
+To reproduce, build the release CLI at commit `fcabd41`, set `MOSH_FORMAT_3_CLI` to that executable, and run `cargo test --locked --release supplemental_storage_budget -- --ignored --nocapture`. The test removes its generated files and Ledgers.

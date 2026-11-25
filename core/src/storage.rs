@@ -151,7 +151,7 @@ impl Mosh {
             let mut physical = std::collections::HashSet::new();
             let mut representative = None;
             for item in members.by_ref() {
-                let item = item?;
+                let mut item = item?;
                 let Ok(mut reader) = checked_snapshot(&item) else {
                     errors += 1;
                     continue;
@@ -168,6 +168,7 @@ impl Mosh {
                     representative = Some(reader);
                 }
                 physical.insert(item.native_id.clone().unwrap_or_else(|| item.id.clone()));
+                fsmeta::populate(&mut item);
                 output.push(item);
             }
             if output.len() > 1 {
@@ -198,11 +199,26 @@ impl Mosh {
         let root = path_text(&root)?;
         let (low, high) = prefix(root);
         let scope = "kind='file' AND reparse=0 AND missing=0 AND path>=?1 AND path<?2";
-        let totals=self.db.query_row(&format!("SELECT count(*), coalesce(sum(size),0), count(*)-count(allocated) FROM objects WHERE {scope}"),
-            params![low,high],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?)))?;
-        let allocated=self.db.query_row(&format!("SELECT coalesce(sum(bytes),0) FROM (
-            SELECT max(allocated) bytes FROM objects WHERE {scope} GROUP BY coalesce(native_id,id))"),
-            params![low,high],|r|r.get::<_,i64>(0))?;
+        let totals = self.db.query_row(
+            &format!(
+                "WITH live AS MATERIALIZED (
+            SELECT id,size,native_id,mosh_live_allocated(path,native_id,created,reparse) allocated
+            FROM objects WHERE {scope}
+          ), physical AS (
+            SELECT max(allocated) bytes FROM live GROUP BY coalesce(native_id,id)
+          ) SELECT count(*),coalesce(sum(size),0),count(*)-count(allocated),
+             (SELECT coalesce(sum(bytes),0) FROM physical) FROM live"
+            ),
+            params![low, high],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            },
+        )?;
         let mut distribution = self.db.prepare(&format!(
             "SELECT
             CASE WHEN size<1024 THEN 'Under 1 KiB' WHEN size<1048576 THEN '1 KiB–1 MiB'
@@ -228,9 +244,12 @@ impl Mosh {
         let mut largest = self.db.prepare(&format!(
             "SELECT * FROM objects WHERE {scope} ORDER BY size DESC LIMIT 20"
         ))?;
-        let largest = largest
+        let mut largest = largest
             .query_map(params![low, high], object)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        for item in &mut largest {
+            fsmeta::populate(item);
+        }
         let mut tree=self.db.prepare(&format!("SELECT CASE WHEN instr(substr(path,length(?1)+1),?3)=0 THEN substr(path,length(?1)+1)
             ELSE substr(path,length(?1)+1,instr(substr(path,length(?1)+1),?3)-1) END name,
             count(*),sum(size) FROM objects WHERE {scope} GROUP BY name ORDER BY sum(size) DESC LIMIT 100"))?;
@@ -238,7 +257,7 @@ impl Mosh {
             "name":r.get::<_,String>(0)?,"files":r.get::<_,i64>(1)?,"logical":r.get::<_,i64>(2)?
         })))?.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(
-            json!({"root":root,"files":totals.0,"logical":totals.1,"known_allocated":allocated,
+            json!({"root":root,"files":totals.0,"logical":totals.1,"known_allocated":totals.3,
             "unknown_allocation":totals.2,"largest":largest,"types":kinds,"distribution":distribution,"tree":tree}),
         )
     }
