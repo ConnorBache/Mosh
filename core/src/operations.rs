@@ -467,10 +467,19 @@ impl Mosh {
         let mut statement = self
             .db
             .prepare("SELECT step,state,details FROM plan_steps WHERE plan=? ORDER BY step")?;
-        let steps=statement.query_map([id],|r| {
+        let mut steps=statement.query_map([id],|r| {
             let details=r.get::<_,Option<String>>(2)?.and_then(|s|serde_json::from_str::<Value>(&s).ok());
             Ok(json!({"step":r.get::<_,usize>(0)?,"state":r.get::<_,String>(1)?,"details":details}))
         })?.collect::<rusqlite::Result<Vec<_>>>()?;
+        if manifest.action == Action::Tag && state == "done" && steps.is_empty() {
+            steps.extend(
+                manifest
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .map(|(index, _)| json!({"step":index,"state":"done","details":null})),
+            );
+        }
         Ok(json!({"state":state,"manifest":manifest,"steps":steps}))
     }
 
@@ -530,6 +539,16 @@ impl Mosh {
             "plan is already running"
         );
         let mut collection = None;
+        let tag = if plan.action == Action::Tag {
+            Some(crate::organization::dictionary_id(
+                &tx,
+                plan.argument.as_deref().context("tag missing from plan")?,
+            )?)
+        } else {
+            None
+        };
+        let mut writer = crate::packed_tags::Writer::new(&tx);
+        let mut affected = Vec::new();
         if plan.action == Action::Marriage {
             let id = uuid();
             tx.execute(
@@ -541,16 +560,15 @@ impl Mosh {
         }
         for (index, entry) in plan.entries.iter().enumerate() {
             let item = self.get(&entry.object)?;
-            if plan.action == Action::Tag {
+            if let Some(tag) = tag {
                 self.editable(&item)?;
-                crate::organization::assign(
-                    &tx,
+                affected.push(writer.assign(
                     &item.id,
-                    plan.argument.as_deref().unwrap(),
-                    "user",
-                    1.0,
-                    None,
-                )?;
+                    tag,
+                    crate::packed_tags::USER,
+                    Some((1.0, None)),
+                )?);
+                continue;
             } else if let Some(collection) = &collection {
                 tx.execute(
                     "INSERT INTO edges(container,target,kind) VALUES(?,?,'reference')",
@@ -562,15 +580,29 @@ impl Mosh {
                 params![plan.id, index, json!({"collection":collection}).to_string()],
             )?;
         }
+        writer.flush()?;
         event(
             &tx,
             None,
-            "cleave-metadata",
+            if tag.is_some() {
+                "cleave-tag"
+            } else {
+                "cleave-metadata"
+            },
             Some(&self.actor),
             None,
-            Some(&json!({"plan":plan.id,"collection":collection})),
+            Some(
+                &json!({"plan":plan.id,"collection":collection,"tag":plan.argument.as_deref().filter(|_|tag.is_some()),"affected":affected.len()}),
+            ),
             "ok",
         )?;
+        if tag.is_some() {
+            let event = tx.last_insert_rowid();
+            tx.execute(
+                "INSERT INTO tag_audit_members VALUES(?,?)",
+                params![event, crate::packed_tags::pack_keys(affected)],
+            )?;
+        }
         tx.commit()?;
         self.plan_status(&plan.id)
     }

@@ -6,8 +6,10 @@ Mosh is a local-first file explorer and searchable Ledger for Windows. It indexe
 
 Download the Windows x64 installer or CLI ZIP from [GitHub Releases](https://github.com/ConnorBache/Mosh/releases). The desktop application uses Microsoft Edge WebView2. The initial installer is unsigned. Compare its SHA-256 hash with the release checksum before running it.
 
+The v0.1.0 preview uses Ledger format 1. Build from current source to use packed tags and the optional content cache in Ledger format 2.
+
 1. Open **Mosh** and choose **Index folder**. Select an ordinary directory.
-2. Browse the indexed folder. Double-click a folder to enter it or a file to open it with its Windows association. Select a row to inspect metadata, indexed text, tags, Paint, and available history.
+2. Browse the indexed folder. Double-click a folder to enter it or a file to open it with its Windows association. Select a row to inspect metadata, a text preview, tags, Paint, and available history.
 3. Search using a filename fragment or a query such as `tag:source-code AND modified:<30d`. Open **Tags** to build a filter or **Collections** to create a virtual Coll or Marriage.
 4. Use **Cleave** to preview a selection. Physical operations require confirmation. Quarantine and undo retain recoverable file bytes.
 
@@ -35,17 +37,32 @@ For directory watching, keep the watch command running and use Ctrl+C to stop. M
 
 Queries support uppercase `AND`, `OR`, and `NOT`, standalone parentheses, and an implicit `AND` between expressions. `NOT` binds first, followed by `AND` and then `OR`. Use double quotes inside the expression for phrases and spaces.
 
-- `design` searches indexed text, Paint, names, and paths, and matches partial filenames.
+- `design` searches source text, Paint, names, and paths, and matches partial filenames. Use `name-contains:design` to search names alone without reading file contents.
 - `name:"Design Notes.md"`, `name-contains:design`, `path:archive`, `ext:md`, `kind:file`, and `virtual:true` filter entries.
 - `tag:planning` searches direct and inherited tags. `direct-tag:planning` and `inherited-tag:planning` distinguish the two.
-- `content:"release notes"` and `paint:handoff` select a full-text column.
+- `content:"release notes"` searches source text. `paint:handoff` searches Paint.
 - `modified:<30d` means an age under 30 days. Relative times support `h`, `d`, and `w`. Absolute values use UTC `YYYY-MM-DD` or RFC3339. Use `modified:2026-01-01..2026-02-01` for an inclusive range.
 - `size:>500MB`, `allocated:>=20MiB`, and `duplicate:true` filter by indexed size, allocation, or the last duplicate analysis.
 - `repo:Mosh`, `branch:main`, `git-status:modified`, and `git-author:"Example Author"` filter Git metadata. Author search covers the scan's recent first-parent history.
 
+## Ledger storage
+
+The Ledger stores packed tag sets and reverse lookups. Identical tag sets share a single record. Search and previews read uncached file contents on demand, so broad content queries may take longer. Names, paths, and Paint stay searchable through the metadata index.
+
+~~~powershell
+.\mosh.exe ledger text-index --max-bytes 25000000
+.\mosh.exe ledger text-status
+.\mosh.exe ledger text-index --max-bytes 0
+.\mosh.exe ledger compact
+~~~
+
+The optional content cache stores searchable terms and positions up to the requested number of SQLite page bytes. It invalidates entries after Mosh observes file changes. Run the same command to rebuild it or pass zero to clear it. `doctor` reports the database size, reusable pages, tag storage, and cache sizes. The write-ahead log and temporary SQLite work files can use additional disk space during writes.
+
+Format 1 Ledgers migrate on open. The migration preserves UUIDs, tag origins, aliases, confidence, evidence, Paint, and history. It drops the old extracted-text cache because Mosh can read the source again. Run `mosh ledger compact` to return reusable pages to the filesystem after an upgrade or cache clear. Keep a backup and allow temporary disk space for compaction.
+
 ## Safety and recovery
 
-Scanning stores local paths, metadata, bounded extracted text, and Mosh annotations in SQLite. Treat the Ledger and its backups as sensitive. The application writes files only after a user action. Reparse points are indexed as records and their contents are skipped. Moves and quarantine operate on ordinary files on the same volume. Copy verifies the main data stream and preserves basic times and permissions where supported. Extended attributes and alternate streams can differ on copies.
+Scanning stores local paths, metadata, and Mosh annotations in SQLite. Treat the Ledger and its backups as sensitive. The application writes files only after a user action. Reparse points are indexed as records and their contents are skipped. Moves and quarantine operate on ordinary files on the same volume. Copy verifies the main data stream and preserves basic times and permissions where supported. Extended attributes and alternate streams can differ on copies.
 
 The following workflow prepares a recoverable quarantine. Substitute the plan ID from the preview. The original parent and filename must still be available when restoring.
 
@@ -58,7 +75,7 @@ The following workflow prepares a recoverable quarantine. Substitute the plan ID
 
 If an operation is interrupted, inspect `cleave --status PLAN-ID` and `doctor`. An intent state means a filesystem change may have occurred. Keep both paths and compare their contents with the journal digest before manual recovery. Quarantine files live in `.mosh-quarantine` under a registered root. Mosh excludes this directory from scans.
 
-Use `mosh backup C:\Backups\mosh.sqlite3` for a consistent metadata snapshot. Use `mosh restore C:\Backups\mosh.sqlite3 C:\Recovered\mosh.sqlite3` to restore into a new Ledger. Check it with `mosh --db C:\Recovered\mosh.sqlite3 doctor`. `mosh ledger rebuild` regenerates FTS from stored metadata. Back up original files separately. A fresh scan can rediscover files, but annotations, virtual organization, identities, and previously observed activity require the Ledger backup.
+Use `mosh backup C:\Backups\mosh.sqlite3` for a consistent metadata snapshot. Use `mosh restore C:\Backups\mosh.sqlite3 C:\Recovered\mosh.sqlite3` to restore into a new Ledger. Check it with `mosh --db C:\Recovered\mosh.sqlite3 doctor`. `mosh ledger rebuild` regenerates the metadata search index and packed reverse tag lookups. Back up original files separately. A fresh scan can rediscover files, while annotations, virtual organization, identities, and previously observed activity require the Ledger backup.
 
 ## Local integration API
 

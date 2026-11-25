@@ -8,7 +8,17 @@ SQLite uses foreign keys, WAL, transactional schema initialization, a bounded pa
 
 The scan walks directories without following junctions or symlinks. Metadata and deterministic tags enter a single write transaction. Readers can use the previous snapshot while scanning. Cancellation rolls the transaction back. When a walk reports filesystem errors, the scan retains old records that may simply have become inaccessible. Watch mode batches Windows directory notifications, targets changed paths, and reconciles on event loss.
 
-FTS5 indexes names, paths, extracted content, and Paint. Structured Boolean expressions bind their values to indexed SQL predicates. Tags use a global integer dictionary. The assignment table is keyed by object, tag ID, and origin, with an inverse index for tag lookups. The engine computes inherited tags from physical parents as needed. Alias mappings point at the same integer IDs.
+The Ledger indexes names, paths, and Paint without duplicating their text into the FTS5 tables. Previews open the current file on demand. Content searches use the optional byte-budgeted FTS5 cache and read uncached files with the same phrase tokenizer. Scans invalidate outdated cache entries.
+
+## Packed tags
+
+The object registry assigns durable integer keys for packed lookups. The existing UUID continues to identify objects in API calls and operations. Names and aliases resolve through the global tag dictionary.
+
+Identical tag sets share an immutable packed record. Mosh chooses among gap-encoded IDs and runs of consecutive IDs. Origin flags retain independent sources and can share a default value for the set. Confidence and evidence departures from the defaults occupy a sparse table.
+
+Reverse lookups group 4,096 object keys at a time and choose the smallest delta list, run list, 512-byte bitmap, or full-block marker. Confirmed and suggested memberships have independent blocks. Intersections of direct tag filters combine blocks before enumerating objects. Inherited queries expand through physical parents.
+
+Tag-set references and affected reverse blocks update in one SQLite transaction. Reverse blocks can be rebuilt from the tag sets. Bulk Cleave tagging writes one audit event and a packed list of object keys, which individual object histories can query.
 
 ## Relationships and permissions
 

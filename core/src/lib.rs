@@ -1,8 +1,10 @@
 mod commands;
+mod content;
 mod fsmeta;
 mod git;
 mod operations;
 mod organization;
+mod packed_tags;
 mod query;
 mod scan;
 mod storage;
@@ -26,6 +28,8 @@ pub struct Mosh {
     db_path: PathBuf,
     actor: String,
 }
+
+const LEDGER_VERSION: i64 = 2;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Object {
@@ -161,19 +165,27 @@ impl Mosh {
         }
         let mut db = Connection::open(path)?;
         db.busy_timeout(Duration::from_secs(15))?;
+        packed_tags::register(&db)?;
+        content::register(&db)?;
         db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA cache_size=-32768; PRAGMA temp_store=FILE;")?;
         let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version == 0 {
+        if version != LEDGER_VERSION {
             let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let locked_version: i64 =
                 tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
+            ensure!(
+                (0..=LEDGER_VERSION).contains(&locked_version),
+                "unsupported Ledger format {locked_version}"
+            );
             if locked_version == 0 {
                 tx.execute_batch(include_str!("schema.sql"))?;
-                tx.pragma_update(None, "user_version", 1)?;
+            }
+            if locked_version < LEDGER_VERSION {
+                packed_tags::migrate(&tx)?;
+                tx.execute_batch(include_str!("ledger_v2.sql"))?;
+                tx.pragma_update(None, "user_version", LEDGER_VERSION)?;
             }
             tx.commit()?;
-        } else {
-            ensure!(version == 1, "unsupported Ledger format {version}");
         }
         ensure!(
             db.query_row(
@@ -269,7 +281,10 @@ impl Mosh {
         let selected = reference.map(|value| self.get(value)).transpose()?;
         let mut statement = self.db.prepare(
             "SELECT time,object,action,actor,previous,current,outcome FROM audit
-             WHERE (?1 IS NULL OR object=?1)
+             WHERE (?1 IS NULL OR object=?1 OR seq IN(
+                 SELECT event FROM tag_audit_members WHERE mosh_keys_contains(keys,
+                     (SELECT key FROM object_keys WHERE object=?1))
+             ))
              ORDER BY seq DESC LIMIT ?2",
         )?;
         let rows = statement.query_map(

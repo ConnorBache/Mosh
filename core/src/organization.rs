@@ -1,4 +1,4 @@
-use crate::{Mosh, Object, event, object, uuid};
+use crate::{Mosh, Object, event, object, packed_tags, uuid};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
@@ -26,7 +26,7 @@ pub(crate) fn tag_name(name: &str) -> Result<String> {
     Ok(normalized)
 }
 
-fn tag_id(db: &Connection, name: &str) -> Result<Option<i64>> {
+pub(crate) fn tag_id(db: &Connection, name: &str) -> Result<Option<i64>> {
     Ok(db
         .query_row(
             "SELECT id FROM tag_dictionary WHERE name=?1
@@ -37,44 +37,15 @@ fn tag_id(db: &Connection, name: &str) -> Result<Option<i64>> {
         .optional()?)
 }
 
-pub(crate) fn assign(
-    db: &Connection,
-    object_id: &str,
-    name: &str,
-    origin: &str,
-    confidence: f64,
-    evidence: Option<&str>,
-) -> Result<()> {
-    ensure!(
-        (0.0..=1.0).contains(&confidence),
-        "confidence must be between zero and one"
-    );
+pub(crate) fn dictionary_id(db: &Connection, name: &str) -> Result<i64> {
     let name = tag_name(name)?;
-    let id = match tag_id(db, &name)? {
+    Ok(match tag_id(db, &name)? {
         Some(id) => id,
         None => {
             db.execute("INSERT INTO tag_dictionary(name) VALUES(?)", [name])?;
             db.last_insert_rowid()
         }
-    };
-    let existing = db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM tag_assignments WHERE object=? AND tag=?)",
-        params![object_id, id],
-        |r| r.get::<_, bool>(0),
-    )?;
-    if !existing {
-        let count: i64 = db.query_row(
-            "SELECT count(DISTINCT tag) FROM tag_assignments WHERE object=?",
-            [object_id],
-            |r| r.get(0),
-        )?;
-        ensure!(count < 1000, "this object already has 1,000 direct tags");
-    }
-    db.execute("INSERT INTO tag_assignments(object,tag,origin,confidence,evidence) VALUES(?,?,?,?,?)
-        ON CONFLICT(object,tag,origin) DO UPDATE SET confidence=excluded.confidence,evidence=excluded.evidence
-        WHERE confidence<>excluded.confidence OR evidence IS NOT excluded.evidence",
-        params![object_id,id,origin,confidence,evidence])?;
-    Ok(())
+    })
 }
 
 impl Mosh {
@@ -196,12 +167,15 @@ impl Mosh {
         let selected = self.get(reference)?;
         let sql = format!("{AUTHORITY}, ancestors(id,depth) AS (
             SELECT ?3,0 UNION ALL SELECT o.parent,depth+1 FROM ancestors a JOIN objects o ON o.id=a.id WHERE o.parent IS NOT NULL
-        )
-        SELECT t.name,a.origin,a.confidence,a.evidence,a.object,ancestors.depth
-        FROM ancestors JOIN objects o ON o.id=ancestors.id JOIN tag_assignments a ON a.object=o.id
-        JOIN tag_dictionary t ON t.id=a.tag
-        WHERE (ancestors.depth=0 OR a.origin<>'suggested') AND {VISIBLE}
-        ORDER BY ancestors.depth,t.name,a.origin");
+        ), origins(bit,name) AS (VALUES(1,'user'),(2,'automatic'),(4,'filesystem'),(8,'git'),(16,'suggested'))
+        SELECT t.name,g.name,coalesce(d.confidence,1),CASE WHEN d.origin IS NOT NULL THEN d.evidence
+            WHEN g.bit=4 THEN 'file metadata' ELSE NULL END,o.id,ancestors.depth
+        FROM ancestors JOIN objects o ON o.id=ancestors.id JOIN object_keys k ON k.object=o.id
+        JOIN tag_sets s ON s.id=k.tag_set JOIN json_each(mosh_set_tags(s.packed)) a
+        JOIN origins g ON (a.value->>1) & g.bit <> 0 JOIN tag_dictionary t ON t.id=(a.value->>0)
+        LEFT JOIN tag_details d ON d.object_key=k.key AND d.tag=t.id AND d.origin=g.bit
+        WHERE (ancestors.depth=0 OR g.bit<>16) AND {VISIBLE}
+        ORDER BY ancestors.depth,t.name,g.name");
         let mut query = self.db.prepare(&sql)?;
         let rows = query.query_map(
             params![self.actor, std::path::MAIN_SEPARATOR_STR, selected.id],
@@ -219,18 +193,29 @@ impl Mosh {
     pub fn tag(&self, reference: &str, name: &str, add: bool, confidence: f64) -> Result<()> {
         let selected = self.get(reference)?;
         self.editable(&selected)?;
-        let tx = self.db.unchecked_transaction()?;
-        let old = tx.query_row("SELECT confidence,evidence FROM tag_assignments WHERE object=?1 AND origin='user' AND tag=(
-            SELECT id FROM tag_dictionary WHERE name=?2 UNION ALL SELECT tag FROM tag_aliases WHERE alias=?2 LIMIT 1)",
-            params![selected.id,tag_name(name)?],|r|Ok(json!({"confidence":r.get::<_,f64>(0)?,"evidence":r.get::<_,Option<String>>(1)?}))).optional()?;
-        if add {
-            assign(&tx, &selected.id, name, "user", confidence, None)?;
-        } else if let Some(id) = tag_id(&tx, &tag_name(name)?)? {
-            tx.execute(
-                "DELETE FROM tag_assignments WHERE object=? AND tag=? AND origin='user'",
-                params![selected.id, id],
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let id = if add {
+            Some(dictionary_id(&tx, name)?)
+        } else {
+            tag_id(&tx, &tag_name(name)?)?
+        };
+        let old = if let Some(id) = id {
+            let old = packed_tags::detail(&tx, &selected.id, id, packed_tags::USER)?;
+            let mut writer = packed_tags::Writer::new(&tx);
+            writer.assign(
+                &selected.id,
+                id,
+                packed_tags::USER,
+                add.then_some((confidence, None)),
             )?;
-        }
+            writer.flush()?;
+            old.map(|(confidence, evidence)| json!({"confidence":confidence,"evidence":evidence}))
+        } else {
+            None
+        };
         event(
             &tx,
             Some(&selected.id),
@@ -246,10 +231,13 @@ impl Mosh {
 
     pub fn tag_catalog(&self, limit: usize) -> Result<Vec<Value>> {
         let sql = format!(
-            "{AUTHORITY} SELECT t.name,count(DISTINCT a.object) FROM tag_assignments a
-            JOIN objects o ON o.id=a.object JOIN tag_dictionary t ON t.id=a.tag
-            WHERE o.missing=0 AND a.origin<>'suggested' AND {VISIBLE}
-            GROUP BY t.id ORDER BY 2 DESC,t.name LIMIT ?3"
+            "{AUTHORITY}, visible_blocks AS MATERIALIZED (
+                SELECT k.key/4096 block,mosh_make_block(json_group_array(k.key%4096)) packed
+                FROM object_keys k JOIN objects o ON o.id=k.object
+                WHERE o.missing=0 AND {VISIBLE} GROUP BY k.key/4096
+            ) SELECT t.name,sum(mosh_block_count(b.packed,v.packed)) n FROM tag_blocks b
+            JOIN visible_blocks v ON v.block=b.block JOIN tag_dictionary t ON t.id=b.tag
+            WHERE b.suggested=0 GROUP BY t.id HAVING n>0 ORDER BY n DESC,t.name LIMIT ?3"
         );
         let mut query = self.db.prepare(&sql)?;
         let rows = query.query_map(
@@ -265,8 +253,8 @@ impl Mosh {
 
     pub fn tag_coverage(&self) -> Result<Value> {
         let sql = format!("{AUTHORITY} SELECT count(*),coalesce(sum(n>=10),0),coalesce(sum(n),0)
-            FROM (SELECT (SELECT count(DISTINCT tag) FROM tag_assignments a WHERE a.object=o.id AND origin<>'suggested') n
-            FROM objects o WHERE o.missing=0 AND {VISIBLE})");
+            FROM (SELECT coalesce(s.confirmed,0) n FROM objects o JOIN object_keys k ON k.object=o.id
+            LEFT JOIN tag_sets s ON s.id=k.tag_set WHERE o.missing=0 AND {VISIBLE})");
         Ok(self.db.query_row(&sql,params![self.actor,std::path::MAIN_SEPARATOR_STR],|r| {
             let total = r.get::<_,i64>(0)?;
             let covered = r.get::<_,i64>(1)?;
@@ -278,10 +266,14 @@ impl Mosh {
         self.admin()?;
         let from = tag_name(from)?;
         let to = to.map(tag_name).transpose()?;
-        let tx = self.db.unchecked_transaction()?;
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
         let id = tag_id(&tx, &from)?.context("unknown tag")?;
         match action {
             "delete" => {
+                packed_tags::Writer::new(&tx).retag(id, None)?;
                 tx.execute("DELETE FROM tag_dictionary WHERE id=?", [id])?;
             }
             "alias" | "rename" => {
@@ -308,8 +300,7 @@ impl Mosh {
                 let target = tag_id(&tx, &to.context("destination tag required")?)?
                     .context("unknown destination tag")?;
                 ensure!(id != target, "choose two distinct tags");
-                tx.execute("INSERT INTO tag_assignments SELECT object,?2,origin,confidence,evidence FROM tag_assignments WHERE tag=?1
-                    ON CONFLICT DO UPDATE SET confidence=excluded.confidence,evidence=excluded.evidence WHERE excluded.confidence>confidence",params![id,target])?;
+                packed_tags::Writer::new(&tx).retag(id, Some(target))?;
                 tx.execute(
                     "UPDATE tag_aliases SET tag=?2 WHERE tag=?1",
                     params![id, target],

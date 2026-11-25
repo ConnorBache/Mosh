@@ -256,6 +256,10 @@ impl Mosh {
                 })?;
         self.db
             .execute("INSERT INTO ledger(ledger) VALUES('integrity-check')", [])?;
+        self.db.execute(
+            "INSERT INTO text_terms(text_terms) VALUES('integrity-check')",
+            [],
+        )?;
         let uncertain = self.db.query_row(
             "SELECT count(*) FROM plan_steps WHERE state IN ('intent','undo-intent')",
             [],
@@ -275,10 +279,25 @@ impl Mosh {
         let ledger_count = self
             .db
             .query_row("SELECT count(*) FROM ledger", [], |r| r.get::<_, i64>(0))?;
+        let reusable = self
+            .db
+            .pragma_query_value(None, "freelist_count", |r| r.get::<_, i64>(0))?;
+        let (forward, reverse):(i64,i64)=self.db.query_row("SELECT
+            coalesce((SELECT sum(s.confirmed) FROM object_keys k JOIN tag_sets s ON s.id=k.tag_set),0),
+            coalesce((SELECT sum(mosh_block_size(packed)) FROM tag_blocks WHERE suggested=0),0)",
+            [],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        let tag_pages: i64 = self.db.query_row(
+            "SELECT coalesce(sum(pgsize),0) FROM dbstat WHERE name GLOB 'tag_*'
+            OR name GLOB 'sqlite_autoindex_tag_*'",
+            [],
+            |r| r.get(0),
+        )?;
+        let text = self.text_status()?;
         Ok(
-            json!({"ok":integrity==["ok"]&&foreign_violations==0&&active==ledger_count,"integrity":integrity,
+            json!({"ok":integrity==["ok"]&&foreign_violations==0&&active==ledger_count&&forward==reverse,"integrity":integrity,
             "foreign_key_violations":foreign_violations,"objects":active,"ledger_documents":ledger_count,
-            "pending_recovery_steps":uncertain,"database_bytes":page_count*page_size}),
+            "pending_recovery_steps":uncertain,"database_bytes":page_count*page_size,"reusable_bytes":reusable*page_size,
+            "tag_storage_bytes":tag_pages,"confirmed_assignments":forward,"confirmed_postings":reverse,"text_cache":text}),
         )
     }
 
@@ -287,11 +306,19 @@ impl Mosh {
         let tx = self.db.unchecked_transaction()?;
         tx.execute_batch(
             "DELETE FROM ledger;
-            INSERT INTO ledger(rowid,object,name,path,content,paint)
-            SELECT o.rowid,o.id,o.name,coalesce(o.path,''),o.content,coalesce(p.body,'')
-            FROM objects o LEFT JOIN paint p ON p.object=o.id WHERE o.missing=0;",
+            INSERT INTO ledger(rowid,name,path,paint)
+            SELECT k.key,o.name,coalesce(o.path,''),coalesce(p.body,'')
+            FROM objects o JOIN object_keys k ON k.object=o.id LEFT JOIN paint p ON p.object=o.id WHERE o.missing=0;",
         )?;
+        crate::packed_tags::rebuild(&tx)?;
         tx.commit()?;
+        Ok(())
+    }
+
+    pub fn compact(&self) -> Result<()> {
+        self.admin()?;
+        self.db
+            .execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")?;
         Ok(())
     }
 
@@ -319,7 +346,10 @@ impl Mosh {
         let source =
             Connection::open_with_flags(source, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         let version: i64 = source.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        ensure!(version == 1, "unsupported Ledger backup format");
+        ensure!(
+            (1..=crate::LEDGER_VERSION).contains(&version),
+            "unsupported Ledger backup format"
+        );
         let status: String = source.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
         ensure!(status == "ok", "backup integrity check failed");
         if let Some(parent) = destination.parent().filter(|p| !p.as_os_str().is_empty()) {

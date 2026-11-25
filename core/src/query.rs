@@ -124,8 +124,18 @@ impl Parser {
     }
 
     fn and(&mut self) -> Result<String> {
-        let mut expressions = vec![self.atom()?];
+        let mut expressions = Vec::new();
+        let mut direct = Vec::new();
         loop {
+            if let Some(Token::Term(term)) = &self.next
+                && let Some(tag) = term.strip_prefix("direct-tag:")
+            {
+                let tag = tag_name(tag)?;
+                self.advance();
+                direct.push(self.bind(tag));
+            } else {
+                expressions.push(self.atom()?);
+            }
             match self.next {
                 Some(Token::And) => {
                     self.advance();
@@ -133,8 +143,9 @@ impl Parser {
                 Some(Token::Not | Token::Open | Token::Term(_)) => {}
                 _ => break,
             }
-            expressions.push(self.atom()?);
         }
+        // Bound the join width for long direct-tag conjunctions.
+        expressions.extend(direct.chunks(8).map(direct_intersection));
         Ok(expressions.join(" AND "))
     }
 
@@ -160,13 +171,10 @@ impl Parser {
         let clause = match field {
             "tag" | "direct-tag" | "inherited-tag" | "suggested-tag" => {
                 let id = self.bind(tag_name(value)?);
-                let origin = if field == "suggested-tag" {
-                    "a.origin='suggested'"
-                } else {
-                    "a.origin<>'suggested'"
-                };
-                let direct = format!("SELECT a.object FROM tag_assignments a WHERE {origin}
-                    AND a.tag IN(SELECT id FROM tag_dictionary WHERE name={id} UNION SELECT tag FROM tag_aliases WHERE alias={id})");
+                let suggested = u8::from(field == "suggested-tag");
+                let direct = format!("SELECT k.object FROM tag_blocks b JOIN json_each(mosh_block_slots(b.packed)) p
+                    JOIN object_keys k ON k.key=b.block*4096+p.value WHERE b.suggested={suggested}
+                    AND b.tag IN(SELECT id FROM tag_dictionary WHERE name={id} UNION SELECT tag FROM tag_aliases WHERE alias={id})");
                 if matches!(field, "tag" | "inherited-tag") {
                     let selection = if field == "tag" {
                         "SELECT id FROM matched"
@@ -295,26 +303,62 @@ impl Parser {
                 )
             }
             "content" | "paint" | "text" | "" => {
-                let col = if matches!(field, "content" | "paint") {
-                    format!("{field}:")
-                } else {
-                    String::new()
-                };
-                let escaped = format!("{col}\"{}\"", value.replace('"', "\"\""));
-                let fts = self.bind(escaped);
-                let full_text =
-                    format!("o.rowid IN(SELECT rowid FROM ledger WHERE ledger MATCH {fts})");
-                if field.is_empty() {
-                    let name = self.bind(value.to_owned());
-                    format!("({full_text} OR instr(lower(o.name),lower({name}))>0)")
-                } else {
-                    full_text
+                let phrase = format!("\"{}\"", value.replace('"', "\"\""));
+                let mut clauses = Vec::new();
+                if field != "content" {
+                    let fts = self.bind(if field == "paint" {
+                        format!("paint:{phrase}")
+                    } else {
+                        phrase.clone()
+                    });
+                    clauses.push(format!("o.id IN(SELECT k.object FROM ledger JOIN object_keys k ON k.key=ledger.rowid WHERE ledger MATCH {fts})"));
                 }
+                if field.is_empty() {
+                    clauses.push(format!(
+                        "instr(lower(o.name),lower({}))>0",
+                        self.bind(value.to_owned())
+                    ));
+                }
+                if field != "paint" {
+                    let term = self.bind(phrase);
+                    clauses.push(format!("o.id IN(SELECT k.object FROM text_terms JOIN object_keys k ON k.key=text_terms.rowid
+                        WHERE text_terms MATCH {term})"));
+                    clauses.push(format!("CASE WHEN o.missing=0 AND o.kind='file' AND o.reparse=0 AND o.path IS NOT NULL
+                        AND mosh_text_supported(o.extension) AND {VISIBLE} AND NOT EXISTS(
+                            SELECT 1 FROM object_keys k JOIN text_cached c ON c.key=k.key WHERE k.object=o.id
+                        ) THEN mosh_live_match(o.path,o.extension,o.native_id,o.created,{term}) ELSE 0 END"));
+                }
+                format!("({})", clauses.join(" OR "))
             }
             _ => bail!("unknown search field {field}"),
         };
         Ok(clause)
     }
+}
+
+fn direct_intersection(tags: &[String]) -> String {
+    let resolved = |id: &str| {
+        format!(
+            "SELECT id FROM tag_dictionary WHERE name={id} UNION SELECT tag FROM tag_aliases WHERE alias={id}"
+        )
+    };
+    let mut joins = String::new();
+    let mut packed = vec!["b0.packed".to_owned()];
+    for (index, tag) in tags.iter().enumerate().skip(1) {
+        joins.push_str(&format!(
+            " JOIN tag_blocks b{index} ON b{index}.block=b0.block
+            AND b{index}.suggested=0 AND b{index}.tag IN({})",
+            resolved(tag)
+        ));
+        packed.push(format!("b{index}.packed"));
+    }
+    format!(
+        "o.id IN(SELECT k.object FROM tag_blocks b0 {joins}
+        JOIN json_each(mosh_common_slots({})) p JOIN object_keys k ON k.key=b0.block*4096+p.value
+        WHERE b0.suggested=0 AND b0.tag IN({}))",
+        packed.join(","),
+        resolved(&tags[0])
+    )
 }
 
 fn comparison(input: &str) -> (&str, &str) {

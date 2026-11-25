@@ -16,11 +16,7 @@ fn limit(payload: &Value) -> usize {
 impl Mosh {
     pub fn preview(&self, reference: &str) -> Result<String> {
         let item = self.get(reference)?;
-        Ok(self
-            .db
-            .query_row("SELECT content FROM objects WHERE id=?", [item.id], |r| {
-                r.get(0)
-            })?)
+        Ok(crate::content::preview(&item))
     }
 
     pub fn open_in_system(&self, reference: &str) -> Result<()> {

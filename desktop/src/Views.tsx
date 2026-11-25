@@ -78,7 +78,7 @@ export function Inspector({ item, generation, refresh, fail, close, show }: {
       <details className="inspect-block"><summary>Native and Ledger metadata</summary>
         <pre>{JSON.stringify({ ...object, owners: detail?.owners, windows_security: detail?.windows_security }, null, 2)}</pre></details>
     </>}
-    {tab === 'Preview' && (preview ? <pre className="preview">{preview}</pre> : <p className="muted">No indexed text preview is available.</p>)}
+    {tab === 'Preview' && (preview ? <pre className="preview">{preview}</pre> : <p className="muted">No text preview is available.</p>)}
     {tab === 'History' && <section className="inspect-block">
       {history.map((record, index) => <div className="compact-event" key={index}><strong>{record.action}</strong><span>{displayDate(record.time)}</span></div>)}
       {!!commits.length && <h3><GitBranch size={15} /> Git history</h3>}

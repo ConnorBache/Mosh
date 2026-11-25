@@ -220,13 +220,62 @@ pub(crate) fn open_snapshot(path: &Path) -> std::io::Result<File> {
     }
 }
 
-pub(crate) fn text(path: &Path, extension: &str) -> String {
-    inspect_text(path, extension).unwrap_or_default()
+pub(crate) fn text_supported(extension: &str) -> bool {
+    matches!(
+        extension,
+        "docx"
+            | "pptx"
+            | "xlsx"
+            | "odt"
+            | "ods"
+            | "odp"
+            | "zip"
+            | "txt"
+            | "md"
+            | "markdown"
+            | "rs"
+            | "js"
+            | "jsx"
+            | "ts"
+            | "tsx"
+            | "py"
+            | "cs"
+            | "c"
+            | "cpp"
+            | "h"
+            | "hpp"
+            | "java"
+            | "kt"
+            | "go"
+            | "rb"
+            | "swift"
+            | "html"
+            | "css"
+            | "sh"
+            | "ps1"
+            | "bat"
+            | "cmd"
+            | "lua"
+            | "sql"
+            | "json"
+            | "jsonl"
+            | "xml"
+            | "yaml"
+            | "yml"
+            | "toml"
+            | "csv"
+            | "tsv"
+            | "ini"
+            | "log"
+            | "rst"
+            | "svg"
+            | "conf"
+    )
 }
 
 const TEXT_LIMIT: u64 = 128 * 1024;
 
-fn inspect_text(path: &Path, extension: &str) -> anyhow::Result<String> {
+pub(crate) fn text(path: &Path, extension: &str) -> anyhow::Result<String> {
     let file = open_snapshot(path)?;
     if matches!(
         extension,
@@ -283,51 +332,6 @@ fn inspect_text(path: &Path, extension: &str) -> anyhow::Result<String> {
             }
         }
         return Ok(result);
-    }
-    if !matches!(
-        extension,
-        "txt"
-            | "md"
-            | "markdown"
-            | "rs"
-            | "js"
-            | "jsx"
-            | "ts"
-            | "tsx"
-            | "py"
-            | "cs"
-            | "c"
-            | "cpp"
-            | "h"
-            | "hpp"
-            | "java"
-            | "kt"
-            | "go"
-            | "rb"
-            | "swift"
-            | "html"
-            | "css"
-            | "sh"
-            | "ps1"
-            | "bat"
-            | "cmd"
-            | "lua"
-            | "sql"
-            | "json"
-            | "jsonl"
-            | "xml"
-            | "yaml"
-            | "yml"
-            | "toml"
-            | "csv"
-            | "tsv"
-            | "ini"
-            | "log"
-            | "rst"
-            | "svg"
-            | "conf"
-    ) {
-        return Ok(String::new());
     }
     let mut data = Vec::new();
     file.take(TEXT_LIMIT).read_to_end(&mut data)?;

@@ -23,3 +23,15 @@ Run `python scripts/measure.py <path-to-mosh.exe>` to measure a synthetic local 
 - A one-file quarantine took 51.08 ms and undo took 49.73 ms, including CLI startup.
 
 The results describe this fixture and build profile. Large-scale validation, isolated engine latency, and process memory profiling remain deferred.
+
+## Packed Ledger on the Linux kernel tree
+
+The Windows x64 release build scanned an extracted upstream Linux kernel snapshot with **97,274 regular files** and **1,677,682,083 source bytes**. The extraction skipped 106 symlinks and 13 filenames that collide under Windows case-insensitive lookup. The test populated the packed Ledger with 100 and then 1,000 total direct tags per regular file using a synthetic 2,048-tag vocabulary. Tags were partly shared by groups of nearby files and partly varied per file. The optional source-text cache stayed off. [Pinned kernel snapshot](https://github.com/torvalds/linux/tree/4dce97c6c265544342e716e62fd24bbb232590c5)
+
+- The initial scan took **66.0 seconds**. The compacted Ledger used **153.4 MB**, including filesystem tags.
+- At **100 tags per file**, the compacted Ledger used **173.7 MB**. Tag storage accounted for **21.2 MB**. The complete Ledger added **10.4%** to source bytes.
+- At **1,000 tags per file**, the compacted Ledger used **237.9 MB**. Tag storage accounted for **85.4 MB**. The complete Ledger added **14.2%** to source bytes.
+
+The test includes the object registry, metadata search, both tag directions, and the scan audit log. Synthetic bulk writes use the production packing code and omit individual tag-add audit events. The figures measure the database file after compaction. Transaction logs and compaction can temporarily require more free space. Tag-vocabulary diversity, confidence and evidence, history, and optional source indexing can change the footprint.
+
+To reproduce the storage check against an extracted kernel snapshot, set `MOSH_KERNEL_ROOT` to its root directory and run `cargo test --locked --release -p mosh-core --lib kernel_storage_budget -- --ignored --nocapture`.

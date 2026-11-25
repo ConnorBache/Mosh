@@ -150,6 +150,7 @@ fn deterministic_tags(extension: &str, kind: &str, mime: Option<&str>) -> Vec<St
 
 fn index_one(
     db: &Connection,
+    tag_writer: &mut crate::packed_tags::Writer<'_>,
     path: &Path,
     seen: &str,
     actor: &str,
@@ -217,22 +218,20 @@ fn index_one(
     });
     let renamed = previous.as_ref().is_some_and(|old| old.path != key);
     let new = previous.is_none();
-    let content =
-        (changed && kind == "file" && !is_reparse).then(|| fsmeta::text(path, &extension));
     let id = previous.as_ref().map(|p| p.id.clone()).unwrap_or_else(uuid);
     let link_target = is_reparse
         .then(|| fs::read_link(path).ok())
         .flatten()
         .and_then(|p| p.to_str().map(str::to_owned));
     db.prepare_cached("INSERT INTO objects(id,kind,path,parent,name,extension,mime,size,allocated,created,modified,accessed,changed,
-        attributes,native_id,volume,filesystem,hardlinks,reparse,link_target,seen,content)
-        VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,coalesce(?22,''))
+        attributes,native_id,volume,filesystem,hardlinks,reparse,link_target,seen)
+        VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)
         ON CONFLICT(id) DO UPDATE SET path=?3,parent=?4,name=?5,extension=?6,mime=?7,size=?8,allocated=?9,created=?10,modified=?11,
         accessed=?12,changed=?13,attributes=?14,native_id=coalesce(?15,native_id),volume=coalesce(?16,volume),filesystem=coalesce(?17,filesystem),
-        hardlinks=?18,reparse=?19,link_target=?20,seen=?21,content=coalesce(?22,content),revision=revision+?23,
-        hash=CASE WHEN ?23=1 THEN NULL ELSE hash END")?
+        hardlinks=?18,reparse=?19,link_target=?20,seen=?21,revision=revision+?22,
+        hash=CASE WHEN ?22=1 THEN NULL ELSE hash END")?
         .execute(params![id,kind,key,parent,name,extension,mime,size,native.allocated,created,modified,accessed,native.changed,
-            native.attributes,native.id,native.volume,filesystem,native.hardlinks,is_reparse,link_target,seen,content,changed])?;
+            native.attributes,native.id,native.volume,filesystem,native.hardlinks,is_reparse,link_target,seen,changed])?;
     if new && kind == "coll" {
         db.prepare_cached("INSERT INTO owners VALUES(?,?)")?
             .execute(params![id, actor])?;
@@ -241,14 +240,11 @@ fn index_one(
             AND instr(substr(path,length(?2)+1),?4)=0")?.execute(params![id,low,high,std::path::MAIN_SEPARATOR_STR])?;
     }
     if new || renamed {
-        db.prepare_cached("DELETE FROM tag_assignments WHERE object=? AND origin='filesystem'")?
-            .execute([&id])?;
-        for name in deterministic_tags(&extension, kind, mime) {
-            db.prepare_cached("INSERT OR IGNORE INTO tag_dictionary(name) SELECT ?1 WHERE NOT EXISTS(SELECT 1 FROM tag_aliases WHERE alias=?1)")?.execute([&name])?;
-            db.prepare_cached("INSERT OR IGNORE INTO tag_assignments(object,tag,origin,confidence,evidence)
-                SELECT ?1,id,'filesystem',1,'file metadata' FROM tag_dictionary WHERE name=?2
-                UNION ALL SELECT ?1,tag,'filesystem',1,'file metadata' FROM tag_aliases WHERE alias=?2")?.execute(params![id,name])?;
-        }
+        let ids = deterministic_tags(&extension, kind, mime)
+            .iter()
+            .map(|name| crate::organization::dictionary_id(db, name))
+            .collect::<Result<Vec<_>>>()?;
+        tag_writer.filesystem(&id, &ids)?;
     }
     if new || changed || renamed {
         let before = previous.map(|old|json!({"path":old.path,"size":old.size,"modified":old.modified,"native_id":old.native}));
@@ -304,6 +300,7 @@ impl Mosh {
             "INSERT INTO roots VALUES(?,?) ON CONFLICT DO UPDATE SET scanned=excluded.scanned",
             params![path_text(&root)?, now()],
         )?;
+        crate::content::trim_after_invalidation(&tx)?;
         tx.commit()?;
         self.apply_rules(&mut report)?;
         Ok(report)
@@ -314,6 +311,7 @@ impl Mosh {
         let seen = uuid();
         let mut report = ScanReport::default();
         let mut volumes = HashMap::new();
+        let mut tag_writer = crate::packed_tags::Writer::new(db);
         let mut repos = BTreeSet::new();
         if let Some(repo) = crate::git::root(root) {
             repos.insert(repo);
@@ -333,6 +331,13 @@ impl Mosh {
                 }
             };
             let path = entry.path();
+            if path.to_str().is_none() {
+                report.warning(format!(
+                    "{}: the path cannot be represented as Unicode",
+                    path.display()
+                ));
+                continue;
+            }
             if skip(path, &self.db_path) {
                 if entry.file_name() == ".git" {
                     if let Some(parent) = path.parent() {
@@ -354,14 +359,18 @@ impl Mosh {
                     continue;
                 }
             }
-            match index_one(db, path, &seen, &self.actor, &mut volumes) {
+            match index_one(db, &mut tag_writer, path, &seen, &self.actor, &mut volumes) {
                 Ok(changed) => {
                     report.scanned += 1;
                     report.changed += u64::from(changed);
                 }
-                Err(error) => report.warning(format!("{}: {error:#}", path.display())),
+                Err(error) if error.is::<std::io::Error>() => {
+                    report.warning(format!("{}: {error:#}", path.display()))
+                }
+                Err(error) => return Err(error.context(format!("indexing {}", path.display()))),
             }
         }
+        tag_writer.flush()?;
         if report.errors == 0 {
             report.missing = forgotten(db, path_text(root)?, Some(&seen))?;
         }
@@ -385,8 +394,11 @@ impl Mosh {
         if rows.is_empty() {
             return Ok(());
         }
-        let tx = self.db.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+        let mut writer = crate::packed_tags::Writer::new(&tx);
         for (tag, query) in rows {
+            let tag = crate::organization::dictionary_id(&tx, &tag)?;
+            let origin = crate::packed_tags::origin_bit("automatic")?;
             let mut offset = 0;
             loop {
                 let page = self.search(
@@ -401,17 +413,17 @@ impl Mosh {
                     break;
                 }
                 for item in &page {
-                    if let Err(error) = crate::organization::assign(
-                        &tx,
-                        &item.id,
-                        &tag,
-                        "automatic",
-                        1.0,
-                        Some(&query),
-                    ) {
-                        report.warning(error);
+                    if let Err(error) =
+                        writer.assign(&item.id, tag, origin, Some((1.0, Some(&query))))
+                    {
+                        if error.is::<crate::packed_tags::TagLimit>() {
+                            report.warning(error);
+                        } else {
+                            return Err(error);
+                        }
                     }
                 }
+                writer.flush()?;
                 offset += page.len();
             }
         }
@@ -432,7 +444,16 @@ impl Mosh {
             Ok(_) if skip(path, &self.db_path) => ScanReport::default(),
             Ok(meta) if meta.is_dir() && !fsmeta::reparse(&meta) => self.walk(&tx, path, cancel)?,
             Ok(_) => {
-                let changed = index_one(&tx, path, &uuid(), &self.actor, &mut HashMap::new())?;
+                let mut writer = crate::packed_tags::Writer::new(&tx);
+                let changed = index_one(
+                    &tx,
+                    &mut writer,
+                    path,
+                    &uuid(),
+                    &self.actor,
+                    &mut HashMap::new(),
+                )?;
+                writer.flush()?;
                 if let Some(repo) = crate::git::root(path) {
                     crate::git::refresh(&tx, &repo)?;
                 }
@@ -449,6 +470,7 @@ impl Mosh {
             },
             Err(error) => return Err(error.into()),
         };
+        crate::content::trim_after_invalidation(&tx)?;
         tx.commit()?;
         Ok(report)
     }

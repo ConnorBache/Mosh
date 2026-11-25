@@ -102,6 +102,174 @@ fn search_inheritance_paint_and_identity_survive_rename() -> Result<()> {
 }
 
 #[test]
+fn v1_migration_preserves_provenance_aliases_and_search_across_vacuum() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let database = temporary.path().join("old.sqlite3");
+    let file = temporary.path().join("original.txt");
+    fs::write(&file, "a résumé on waterways")?;
+    {
+        let db = rusqlite::Connection::open(&database)?;
+        db.execute_batch(include_str!("../src/schema.sql"))?;
+        db.pragma_update(None, "user_version", 1)?;
+        db.execute(
+            "INSERT INTO objects(id,kind,path,name,extension,content) VALUES
+            ('old-id','file',?,'original.txt','txt','a stale copy of the original')",
+            [file.to_str().unwrap()],
+        )?;
+        db.execute_batch("INSERT INTO tag_dictionary VALUES(1,'topic'),(2,'candidate'),(3,'subject');
+            INSERT INTO tag_aliases VALUES('topic-alias',1);
+            INSERT INTO tag_assignments VALUES
+            ('old-id',1,'user',0.9,NULL),('old-id',1,'automatic',0.4,'rule detail'),
+            ('old-id',2,'suggested',0.7,'assistant detail'),('old-id',3,'automatic',0.1,'weaker rule');
+            INSERT INTO paint VALUES('old-id','standard','A useful note',1,1,'user');")?;
+    }
+    let mosh = Mosh::open(&database)?;
+    assert_eq!(mosh.get("old-id")?.path.as_deref(), file.to_str());
+    let check = |query| {
+        mosh.search(query, &SearchOptions::default())
+            .map(|found| found.len())
+    };
+    assert_eq!(check("direct-tag:topic-alias AND direct-tag:subject")?, 1);
+    assert_eq!(check("suggested-tag:candidate")?, 1);
+    assert_eq!(check("direct-tag:candidate")?, 0);
+    assert_eq!(check("paint:useful")?, 1);
+    assert_eq!(check("content:resume")?, 1);
+    assert_eq!(check("content:stale")?, 0);
+    mosh.tag("old-id", "topic", false, 1.0)?;
+    assert_eq!(check("direct-tag:topic-alias")?, 1);
+    mosh.tag_dictionary("merge", "topic", Some("subject"))?;
+    let tags = mosh.tags("old-id")?;
+    let migrated = tags.iter().find(|tag| tag["name"] == "subject").unwrap();
+    assert_eq!(migrated["confidence"], 0.4);
+    assert_eq!(migrated["evidence"], "rule detail");
+    assert_eq!(migrated["origin"], "automatic");
+    assert_eq!(
+        check("direct-tag:topic-alias AND direct-tag:topic AND NOT direct-tag:candidate")?,
+        1
+    );
+    assert!(
+        mosh.tag_catalog(20)?
+            .iter()
+            .all(|entry| entry["name"] != "candidate")
+    );
+    mosh.tag_dictionary("delete", "candidate", None)?;
+    assert_eq!(check("suggested-tag:candidate")?, 0);
+    mosh.compact()?;
+    mosh.rebuild()?;
+    assert_eq!(
+        check("name:original.txt AND paint:useful AND direct-tag:subject")?,
+        1
+    );
+    assert_eq!(mosh.doctor()?["ok"], true);
+    assert_eq!(
+        rusqlite::Connection::open(&database)?.query_row(
+            "SELECT count(*) FROM pragma_table_info('objects') WHERE name='content'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )?,
+        0
+    );
+    Ok(())
+}
+
+#[test]
+fn bounded_content_cache_falls_back_to_live_text_and_invalidates_on_scan() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let file = fixture.root.join("report.md");
+    fs::write(&file, "Résumé on lunar navigation")?;
+    fixture.scan()?;
+    assert_eq!(fixture.mosh.text_status()?["cached_files"], 0);
+    assert_eq!(fixture.search(r#"content:"resume on""#)?, ["report.md"]);
+    let stop = AtomicBool::new(false);
+    let too_small = fixture.mosh.index_text(1, &stop)?;
+    assert_eq!(too_small["cached_files"], 0);
+    assert_eq!(too_small["budget_reached"], true);
+    let built = fixture.mosh.index_text(128 * 1024, &stop)?;
+    assert_eq!(built["cached_files"], 1);
+    assert!(built["cache_bytes"].as_i64().unwrap() <= 128 * 1024);
+    assert_eq!(
+        fixture.search(r#"content:"lunar navigation""#)?,
+        ["report.md"]
+    );
+    assert_eq!(
+        rusqlite::Connection::open(&fixture.db)?.query_row(
+            "SELECT body IS NULL FROM text_terms",
+            [],
+            |r| r.get::<_, bool>(0)
+        )?,
+        true
+    );
+    fs::write(&file, "Replacement from another revision")?;
+    fixture.scan()?;
+    assert_eq!(fixture.mosh.text_status()?["cached_files"], 0);
+    assert_eq!(fixture.search("content:replacement")?, ["report.md"]);
+    assert!(fixture.search("content:lunar")?.is_empty());
+    assert!(
+        fixture
+            .mosh
+            .preview(file.to_str().unwrap())?
+            .contains("another revision")
+    );
+    assert_eq!(fixture.mosh.index_text(0, &stop)?["budget_bytes"], 0);
+    Ok(())
+}
+
+#[test]
+fn cleave_tag_records_one_packed_membership_event() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let one = fixture.root.join("one.md");
+    let two = fixture.root.join("two.md");
+    fs::write(&one, "first")?;
+    fs::write(&two, "second")?;
+    fixture.scan()?;
+    fixture
+        .mosh
+        .tag(one.to_str().unwrap(), "only-one", true, 1.0)?;
+    let plan = fixture
+        .mosh
+        .plan("ext:md", Action::Tag, Some("marked"), &[])?;
+    let status = fixture
+        .mosh
+        .execute_plan(&plan.id, false, &AtomicBool::new(false))?;
+    assert_eq!(status["steps"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        fixture.search("direct-tag:marked AND direct-tag:only-one")?,
+        ["one.md"]
+    );
+    assert_eq!(
+        fixture
+            .search("direct-tag:marked AND direct-tag:unknown")?
+            .len(),
+        0
+    );
+    for file in [one, two] {
+        let history = fixture.mosh.history(file.to_str(), 20)?;
+        assert_eq!(
+            history
+                .iter()
+                .filter(|row| row["action"] == "cleave-tag")
+                .count(),
+            1
+        );
+    }
+    let db = rusqlite::Connection::open(&fixture.db)?;
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM plan_steps WHERE plan=?",
+            [plan.id],
+            |r| r.get::<_, i64>(0)
+        )?,
+        0
+    );
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM tag_audit_members", [], |r| r
+            .get::<_, i64>(0))?,
+        1
+    );
+    Ok(())
+}
+
+#[test]
 fn virtual_members_and_secret_sources_use_authority() -> Result<()> {
     let fixture = Fixture::new()?;
     let vault = fixture.root.join("vault");
