@@ -5,6 +5,7 @@ mod git;
 mod individuality;
 mod intelligence;
 mod lean;
+mod metadata_search;
 pub mod models;
 mod nested;
 mod operations;
@@ -38,7 +39,7 @@ pub struct Mosh {
     actor: String,
 }
 
-const LEDGER_VERSION: i64 = 9;
+const LEDGER_VERSION: i64 = 10;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Object {
@@ -180,6 +181,7 @@ impl Mosh {
         packed_tags::register(&db)?;
         content::register(&db)?;
         lean::register(&db)?;
+        metadata_search::register(&db)?;
         fsmeta::register(&db)?;
         nested::register(&db)?;
         db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA cache_size=-32768; PRAGMA temp_store=FILE;")?;
@@ -220,6 +222,10 @@ impl Mosh {
             }
             if locked_version < 9 {
                 tx.execute_batch(include_str!("ledger_v9.sql"))?;
+            }
+            if locked_version < 10 {
+                tx.execute_batch(include_str!("ledger_v10.sql"))?;
+                metadata_search::rebuild(&tx)?;
             }
             tx.pragma_update(None, "user_version", LEDGER_VERSION)?;
             tx.commit()?;

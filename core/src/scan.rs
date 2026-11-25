@@ -341,11 +341,11 @@ impl Mosh {
         let root = canonical(root)?;
         self.outside_children(&root)?;
         let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
-        let report = self.walk(&tx, &root, cancel)?;
         tx.execute(
             "INSERT INTO roots VALUES(?,?) ON CONFLICT DO UPDATE SET scanned=excluded.scanned",
             params![path_text(&root)?, now()],
         )?;
+        let report = self.walk(&tx, &root, cancel)?;
         crate::content::trim_after_invalidation(&tx)?;
         tx.commit()?;
         self.apply_rules()?;

@@ -295,6 +295,90 @@ fn cleave_tag_records_one_packed_membership_event() -> Result<()> {
 }
 
 #[test]
+fn directory_search_shares_postings_and_matches_relative_phrases() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let root = fixture.root.join("machineancestor").join("projectroot");
+    let src = root.join("src");
+    let parser = src.join("parser");
+    let second = fixture.root.join("otherroot");
+    let other_parser = second.join("src").join("parser");
+    fs::create_dir_all(&parser)?;
+    fs::create_dir_all(root.join("unused").join("emptydir"))?;
+    fs::create_dir_all(&other_parser)?;
+    let file = parser.join("léxer.bin");
+    let other = other_parser.join("index.bin");
+    fs::write(&file, [0u8])?;
+    fs::write(&other, [0u8])?;
+    let cancel = AtomicBool::new(false);
+    for path in [&root, &second] {
+        assert_eq!(fixture.mosh.scan(path, &cancel)?.errors, 0);
+    }
+    assert_eq!(
+        fixture.search("kind:file text:parser")?,
+        ["index.bin", "léxer.bin"]
+    );
+    assert_eq!(
+        fixture.search(r#"kind:file text:"src parser""#)?,
+        ["index.bin", "léxer.bin"]
+    );
+    assert_eq!(
+        fixture.search(r#"kind:file text:"parser lexer""#)?,
+        ["léxer.bin"]
+    );
+    assert!(fixture.search(r#"kind:file text:"src lexer""#)?.is_empty());
+    assert!(fixture.search("kind:file text:machineancestor")?.is_empty());
+    assert!(fixture.search("kind:file text:projectroot")?.is_empty());
+
+    let count = fixture.mosh.doctor()?["directory_documents"].clone();
+    fs::write(parser.join("old-léxer.bin"), [0u8])?;
+    assert_eq!(fixture.mosh.scan(&root, &cancel)?.errors, 0);
+    assert_eq!(fixture.mosh.doctor()?["directory_documents"], count);
+
+    let restricted = fixture.mosh.get(parser.to_str().unwrap())?;
+    fixture.mosh.person("guest", None)?;
+    fixture.mosh.secret(&restricted.id, true)?;
+    let guest = Mosh::as_actor(&fixture.db, "guest")?;
+    let visible = guest.search("kind:file text:parser", &SearchOptions::default())?;
+    assert_eq!(visible.len(), 1);
+    assert_eq!(visible[0].name, "index.bin");
+
+    assert_eq!(fixture.mosh.scan(&src, &cancel)?.errors, 0);
+    assert_eq!(fixture.search("kind:file text:src")?, ["index.bin"]);
+    fixture.mosh.rebuild()?;
+    fixture.mosh.compact()?;
+    assert_eq!(fixture.mosh.doctor()?["ok"], true);
+    assert_eq!(
+        fixture.search(r#"kind:file text:"parser lexer""#)?,
+        ["léxer.bin"]
+    );
+    assert_eq!(
+        fixture.search(r#"kind:folder text:"unused emptydir""#)?,
+        ["emptydir"]
+    );
+    let id = fixture.mosh.get(file.to_str().unwrap())?.id;
+    let renamed = src.join("analyzer");
+    fs::rename(&parser, &renamed)?;
+    assert_eq!(fixture.mosh.scan(&src, &cancel)?.errors, 0);
+    assert_eq!(
+        fixture
+            .mosh
+            .get(renamed.join("léxer.bin").to_str().unwrap())?
+            .id,
+        id
+    );
+    assert!(
+        fixture
+            .search(r#"kind:file text:"parser lexer""#)?
+            .is_empty()
+    );
+    assert_eq!(
+        fixture.search(r#"kind:file text:"analyzer lexer""#)?,
+        ["léxer.bin"]
+    );
+    Ok(())
+}
+
+#[test]
 fn virtual_members_and_secret_sources_use_authority() -> Result<()> {
     let fixture = Fixture::new()?;
     let vault = fixture.root.join("vault");

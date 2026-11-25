@@ -40,6 +40,7 @@ fn page_group(name: &str) -> &'static str {
         | "coverage" => "optional_intelligence",
         _ if name.starts_with("object_") => "file_indexes",
         _ if name.starts_with("ledger_") => "name_path_search",
+        _ if name.starts_with("directory_fts_") => "directory_path_search",
         _ if name.starts_with("tag_") || name.starts_with("sqlite_autoindex_tag_") => {
             "packed_tags_and_registry"
         }
@@ -369,6 +370,10 @@ impl Mosh {
         self.db
             .execute("INSERT INTO ledger(ledger) VALUES('integrity-check')", [])?;
         self.db.execute(
+            "INSERT INTO directory_fts(directory_fts) VALUES('integrity-check')",
+            [],
+        )?;
+        self.db.execute(
             "INSERT INTO text_terms(text_terms) VALUES('integrity-check')",
             [],
         )?;
@@ -391,6 +396,12 @@ impl Mosh {
         let ledger_count = self
             .db
             .query_row("SELECT count(*) FROM ledger", [], |r| r.get::<_, i64>(0))?;
+        let (directories, indexed_directories): (i64, i64) = self.db.query_row(
+            "SELECT (SELECT count(*) FROM path_folder_search WHERE relative<>''),
+                    (SELECT count(*) FROM directory_fts)",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
         let reusable = self
             .db
             .pragma_query_value(None, "freelist_count", |r| r.get::<_, i64>(0))?;
@@ -407,8 +418,9 @@ impl Mosh {
         let text = self.text_status()?;
         let storage = self.storage_usage()?;
         Ok(
-            json!({"ok":integrity==["ok"]&&foreign_violations==0&&active==ledger_count&&forward==reverse,"integrity":integrity,
+            json!({"ok":integrity==["ok"]&&foreign_violations==0&&active==ledger_count&&forward==reverse&&directories==indexed_directories,"integrity":integrity,
             "foreign_key_violations":foreign_violations,"objects":active,"ledger_documents":ledger_count,
+            "directory_documents":indexed_directories,
             "pending_recovery_steps":uncertain,"database_bytes":page_count*page_size,"reusable_bytes":reusable*page_size,
             "tag_storage_bytes":tag_pages,"confirmed_assignments":forward,"confirmed_postings":reverse,"text_cache":text,"storage":storage}),
         )
@@ -417,12 +429,7 @@ impl Mosh {
     pub fn rebuild(&self) -> Result<()> {
         self.admin()?;
         let tx = self.db.unchecked_transaction()?;
-        tx.execute_batch(
-            "DELETE FROM ledger;
-            INSERT INTO ledger(rowid,name,path,paint)
-            SELECT k.key,o.name,coalesce(o.path,''),coalesce(p.body,'')
-            FROM objects o JOIN object_keys k ON k.object=o.id LEFT JOIN paint p ON p.object=o.id WHERE o.missing=0;",
-        )?;
+        crate::metadata_search::rebuild(&tx)?;
         crate::packed_tags::rebuild(&tx)?;
         tx.commit()?;
         Ok(())
@@ -462,6 +469,7 @@ impl Mosh {
         let source =
             Connection::open_with_flags(source, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         crate::lean::register(&source)?;
+        crate::metadata_search::register(&source)?;
         let version: i64 = source.pragma_query_value(None, "user_version", |r| r.get(0))?;
         ensure!(
             (1..=crate::LEDGER_VERSION).contains(&version),

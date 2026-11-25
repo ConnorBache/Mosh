@@ -411,12 +411,11 @@ impl Parser {
                     WHERE text_terms MATCH {term}))")
             }
             "content" | "paint" | "text" | "" => {
-                let phrase = format!("\"{}\"", value.replace('"', "\"\""));
+                let phrase = crate::metadata_search::phrase(value);
                 let mut clauses = Vec::new();
                 if field != "content" {
                     if field != "paint" {
-                        let fts = self.bind(format!("{{name path}}:{phrase}"));
-                        clauses.push(format!("o.id IN(SELECT k.object FROM ledger JOIN object_keys k ON k.key=ledger.rowid WHERE ledger MATCH {fts})"));
+                        clauses.extend(self.metadata_matches(value, &phrase));
                     }
                     let fts = self.bind(format!("paint:{phrase}"));
                     let readable = crate::security::allowed("paint");
@@ -443,6 +442,57 @@ impl Parser {
             _ => bail!("unknown search field {field}"),
         };
         Ok(clause)
+    }
+
+    fn metadata_matches(&mut self, value: &str, phrase: &str) -> Vec<String> {
+        let full = self.bind(phrase.to_owned());
+        let mut clauses = vec![
+            format!(
+                "o.id IN(SELECT k.object FROM ledger JOIN object_keys k ON k.key=ledger.rowid
+               WHERE ledger MATCH ('name:'||{full}))"
+            ),
+            format!(
+                "o.path_folder IN(SELECT rowid FROM directory_fts WHERE directory_fts MATCH {full})"
+            ),
+            format!(
+                "(o.kind_code=1 AND mosh_directory_prefix(o.path_literal) IN(
+                SELECT f.prefix FROM directory_fts JOIN path_folders f ON f.id=directory_fts.rowid
+                WHERE directory_fts MATCH {full}))"
+            ),
+            // Folders without direct file members already have a Coll. Rare imported file paths
+            // may also be literal. Evaluate those paths without allocating extra dictionary rows.
+            format!(
+                "CASE WHEN o.path_literal IS NOT NULL AND (o.kind_code=0 OR (o.kind_code=1 AND
+                    NOT EXISTS(SELECT 1 FROM path_folders WHERE prefix=mosh_directory_prefix(o.path_literal)))) THEN
+                mosh_metadata_match((SELECT mosh_search_relative(o.path_literal,r.path) FROM roots r
+                    WHERE mosh_search_relative(o.path_literal,r.path) IS NOT NULL
+                    ORDER BY length(r.path) DESC,r.path LIMIT 1),'',{full}) ELSE 0 END"
+            ),
+        ];
+        if !value.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+            let raw = self.bind(value.to_owned());
+            clauses.push(format!("o.id IN(WITH splits AS MATERIALIZED (
+                SELECT key part,json_extract(value,'$[0]') head,json_extract(value,'$[1]') tail
+                FROM json_each(mosh_metadata_splits({raw}))
+              ), folders AS MATERIALIZED (
+                SELECT s.part,f.id FROM splits s CROSS JOIN directory_fts
+                JOIN path_folder_search f ON f.id=directory_fts.rowid
+                WHERE directory_fts MATCH ('\"'||s.head||'\"') AND mosh_metadata_suffix(f.relative,s.head)
+              ), names AS MATERIALIZED (
+                SELECT s.part,k.object,m.path_folder FROM splits s CROSS JOIN ledger
+                JOIN object_keys k ON k.key=ledger.rowid JOIN objects m ON m.id=k.object
+                WHERE ledger MATCH ('name:^'||s.tail) AND m.path_folder IS NOT NULL
+              ) SELECT n.object FROM names n JOIN folders f ON f.part=n.part AND f.id=n.path_folder)"));
+            // Verify an unusually long phrase directly to keep the list of indexed splits bounded.
+            clauses.push(format!("CASE WHEN mosh_metadata_splits({raw}) IS NULL AND
+                o.path_folder IN(SELECT rowid FROM directory_fts
+                WHERE directory_fts MATCH mosh_metadata_edge({raw},0)) AND o.id IN(
+                SELECT k.object FROM ledger JOIN object_keys k ON k.key=ledger.rowid
+                WHERE ledger MATCH ('name:'||mosh_metadata_edge({raw},1))) THEN
+                mosh_metadata_match((SELECT relative FROM path_folder_search WHERE id=o.path_folder),o.name,{full})
+                ELSE 0 END"));
+        }
+        clauses
     }
 }
 

@@ -214,6 +214,7 @@ impl Mosh {
             "UPDATE objects SET missing=1 WHERE missing=0 AND mosh_within_path(path,?)",
             [path_text(&root)?],
         )?;
+        crate::metadata_search::rebuild_directories(&tx)?;
         event(
             &tx,
             None,
@@ -270,6 +271,7 @@ impl Mosh {
             tx.execute("DELETE FROM nested_moshes WHERE child=?", [child])? == 1,
             "attachment is unavailable"
         );
+        crate::metadata_search::rebuild_directories(&tx)?;
         event(
             &tx,
             None,

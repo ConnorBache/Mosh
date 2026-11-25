@@ -5,8 +5,31 @@ use serde_json::{Value, json};
 use std::{
     fs,
     path::Path,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
+
+pub(crate) fn with_fts_sample<T>(
+    scratch: &Mutex<Option<Connection>>,
+    text: &str,
+    read: impl FnOnce(&Connection) -> rusqlite::Result<T>,
+) -> rusqlite::Result<T> {
+    let mut scratch = scratch.lock().map_err(|_| rusqlite::Error::InvalidQuery)?;
+    if scratch.is_none() {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch("CREATE VIRTUAL TABLE sample USING fts5(body,content='',contentless_delete=1,tokenize='unicode61');
+            CREATE VIRTUAL TABLE sample_tokens USING fts5vocab(sample,instance);")?;
+        *scratch = Some(conn);
+    }
+    let conn = scratch.as_ref().unwrap();
+    conn.prepare_cached("INSERT INTO sample(sample) VALUES('delete-all')")?
+        .execute([])?;
+    conn.prepare_cached("INSERT INTO sample(rowid,body) VALUES(1,?)")?
+        .execute([text])?;
+    read(conn)
+}
 
 fn extract(
     path: &str,
@@ -62,26 +85,29 @@ pub fn register(db: &Connection) -> Result<()> {
         },
     )?;
     // A private in-memory FTS document uses the same tokenizer and phrase semantics as the cache.
-    let scratch = std::sync::Mutex::new(None::<Connection>);
-    db.create_scalar_function("mosh_live_match",5,FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DIRECTONLY,move |ctx| {
-        let path=ctx.get::<String>(0)?;
-        let extension=ctx.get::<String>(1)?;
-        let native=fsmeta::unpack_id(ctx.get_raw(2))?;
-        let created=ctx.get::<Option<i64>>(3)?;
-        let term=ctx.get::<String>(4)?;
-        let Some(text)=extract(&path,&extension,native.as_deref(),created) else { return Ok(false); };
-        if text.is_empty() { return Ok(false); }
-        let mut scratch=scratch.lock().map_err(|_|rusqlite::Error::InvalidQuery)?;
-        if scratch.is_none() {
-            let conn=Connection::open_in_memory()?;
-            conn.execute_batch("CREATE VIRTUAL TABLE sample USING fts5(body, content='', contentless_delete=1, tokenize='unicode61');")?;
-            *scratch=Some(conn);
-        }
-        let conn=scratch.as_ref().unwrap();
-        conn.prepare_cached("DELETE FROM sample")?.execute([])?;
-        conn.prepare_cached("INSERT INTO sample(rowid,body) VALUES(1,?)")?.execute([text])?;
-        conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM sample WHERE sample MATCH ?)")?.query_row([term],|r|r.get(0))
-    })?;
+    let scratch = Mutex::new(None::<Connection>);
+    db.create_scalar_function(
+        "mosh_live_match",
+        5,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DIRECTONLY,
+        move |ctx| {
+            let path = ctx.get::<String>(0)?;
+            let extension = ctx.get::<String>(1)?;
+            let native = fsmeta::unpack_id(ctx.get_raw(2))?;
+            let created = ctx.get::<Option<i64>>(3)?;
+            let term = ctx.get::<String>(4)?;
+            let Some(text) = extract(&path, &extension, native.as_deref(), created) else {
+                return Ok(false);
+            };
+            if text.is_empty() {
+                return Ok(false);
+            }
+            with_fts_sample(&scratch, &text, |conn| {
+                conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM sample WHERE sample MATCH ?)")?
+                    .query_row([term], |r| r.get(0))
+            })
+        },
+    )?;
     Ok(())
 }
 
