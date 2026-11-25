@@ -64,7 +64,7 @@ Use `mosh backup C:\Backups\mosh.sqlite3` for a consistent metadata snapshot. Us
 
 `mosh serve` exposes a read-only API on IPv4 loopback. Set `MOSH_API_TOKEN` to a random bearer token of at least 32 ASCII characters. Use `mosh serve --actor PERSON` for a restricted Mosh identity. The default `local` actor has access to the entire Ledger. Keep the token and the database local.
 
-Send JSON via `POST /v1/search` with a body such as `{"query":"tag:planning","options":{"limit":25}}`. Additional commands are `roots`, `inspect`, `preview`, `history`, `tag_catalog`, `tag_coverage`, `graph`, and `saved`. Object endpoints accept a `reference` string with an indexed path or UUID. Coll permissions govern what Mosh serves. Windows permissions govern direct filesystem access.
+Send JSON via `POST /v1/search` with a body such as `{"query":"tag:planning","options":{"limit":25}}`. Additional commands are `roots`, `inspect`, `preview`, `history`, `tag_catalog`, `tag_coverage`, `graph`, and `saved`. Object endpoints accept a `reference` string with an indexed path or UUID. Audit history is available to the local administrator because it can contain previous locations. Coll permissions govern what Mosh serves. Windows permissions govern direct filesystem access.
 
 ## Build from source
 

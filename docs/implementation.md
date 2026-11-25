@@ -12,8 +12,8 @@ The initial build is the stopping point for the product clarification.
 - [x] Exercise Git status, author filtering, history, and diffs against a fixture repository.
 - [x] Exercise duplicate detection, hardlink accounting, verified file plans, and reversible quarantine.
 - [x] Exercise Ledger integrity, rebuild, and backup restoration.
-- [ ] Smoke-test the versioned read API with a restricted actor.
-- [ ] Verify the 10,000-file fixture and record measured results.
+- [x] Smoke-test the versioned read API with a restricted actor.
+- [x] Verify the 10,000-file fixture and record measured results.
 - [ ] Smoke-test the packaged Windows desktop and publish the installer and CLI.
 
 ## Deferred from the full brief

@@ -140,6 +140,7 @@ fn virtual_members_and_secret_sources_use_authority() -> Result<()> {
     fixture.mosh.collection_query(&first, "content:flame")?;
     let actor = Mosh::as_actor(&fixture.db, "guest")?;
     assert!(actor.inspect(&target.id).is_err());
+    assert!(actor.history(None, 100).is_err());
     assert_eq!(
         actor
             .search("content:flame", &SearchOptions::default())?

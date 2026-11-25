@@ -265,18 +265,15 @@ impl Mosh {
     }
 
     pub fn history(&self, reference: Option<&str>, limit: usize) -> Result<Vec<Value>> {
+        self.admin()?;
         let selected = reference.map(|value| self.get(value)).transpose()?;
         let mut statement = self.db.prepare(
             "SELECT time,object,action,actor,previous,current,outcome FROM audit
-             WHERE (?1 IS NULL OR object=?1) AND (?3='local' OR object IS NOT NULL)
+             WHERE (?1 IS NULL OR object=?1)
              ORDER BY seq DESC LIMIT ?2",
         )?;
         let rows = statement.query_map(
-            params![
-                selected.as_ref().map(|o| &o.id),
-                limit.clamp(1, 1000),
-                self.actor
-            ],
+            params![selected.as_ref().map(|o| &o.id), limit.clamp(1, 1000)],
             |row| {
                 let decode = |index| -> rusqlite::Result<Value> {
                     Ok(row
@@ -291,17 +288,6 @@ impl Mosh {
                 )
             },
         )?;
-        let mut events = Vec::new();
-        for row in rows {
-            let row = row?;
-            if self.actor == "local"
-                || row["object"]
-                    .as_str()
-                    .is_some_and(|id| self.get(id).is_ok())
-            {
-                events.push(row);
-            }
-        }
-        Ok(events)
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 }

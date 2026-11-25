@@ -865,10 +865,14 @@ impl Mosh {
 
 fn leaf(name: &str) -> Result<&str> {
     let mut parts = Path::new(name).components();
+    let lowercase = name.to_ascii_lowercase();
     ensure!(
         !name.is_empty()
             && !name.ends_with(['.', ' '])
-            && !name.contains(['\\', '/', ':', '\0'])
+            && !name.contains(['\\', '/', ':', '*', '?', '"', '<', '>', '|'])
+            && !name.chars().any(char::is_control)
+            && !matches!(lowercase.as_str(), ".git" | ".mosh-quarantine")
+            && !lowercase.starts_with(".mosh-copy-")
             && matches!(parts.next(), Some(Component::Normal(_)))
             && parts.next().is_none(),
         "enter one valid name"
