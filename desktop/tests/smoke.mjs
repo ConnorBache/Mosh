@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { spawn, execFileSync } from 'node:child_process'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -25,20 +25,28 @@ server.listen(0, '127.0.0.1')
 await once(server, 'listening')
 const port = server.address().port
 await new Promise((done) => server.close(done))
+const userData = join(fixture, 'WebView')
+const webviewLog = join(fixture, 'webview.log')
 const app = spawn(application, [], {
-  env: { ...process.env, MOSH_DB: db, WEBVIEW2_USER_DATA_FOLDER: join(fixture, 'WebView'),
-    WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: '--remote-debugging-port=' + port },
-  windowsHide: true,
+  env: { ...process.env, MOSH_DB: db, WEBVIEW2_USER_DATA_FOLDER: userData,
+    WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: '--remote-debugging-port=' + port + ' --enable-logging --log-file="' + webviewLog + '"' },
+  stdio: 'inherit',
 })
 let browser
-const deadline = Date.now() + 20000
+let lastError
+const deadline = Date.now() + 35000
 try {
   while (!browser && Date.now() < deadline) {
     if (app.exitCode !== null) throw new Error('The desktop executable exited before opening its WebView')
     try { browser = await chromium.connectOverCDP('http://127.0.0.1:' + port, { timeout: 1500 }) }
-    catch { await new Promise((done) => setTimeout(done, 250)) }
+    catch (error) { lastError = error; await new Promise((done) => setTimeout(done, 250)) }
   }
-  assert(browser, 'Could not attach to the installed WebView2')
+  if (!browser) {
+    const data = await readdir(userData).catch(() => [])
+    const log = await readFile(webviewLog, 'utf8').catch(() => '')
+    throw new Error('Could not attach to the installed WebView2. Profile entries: ' + data.join(', ') +
+      '\n' + log.slice(-3000), { cause: lastError })
+  }
   const context = browser.contexts()[0]
   const page = context.pages()[0] ?? await context.waitForEvent('page')
   page.setDefaultTimeout(8000)

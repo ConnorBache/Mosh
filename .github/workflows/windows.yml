@@ -33,15 +33,6 @@ jobs:
         run: npm run tauri build -- --bundles nsis --ci
       - name: Build the CLI
         run: cargo +stable build --locked --release -p mosh
-      - name: Install on a clean runner and exercise the real desktop
-        shell: pwsh
-        run: |
-          $installer = Get-ChildItem target/release/bundle/nsis/*-setup.exe | Select-Object -First 1
-          if (-not $installer) { throw 'NSIS installer missing' }
-          $installDir = Join-Path $env:RUNNER_TEMP 'MoshSmoke'
-          $process = Start-Process -FilePath $installer.FullName -ArgumentList '/S',"/D=$installDir" -Wait -PassThru -WindowStyle Hidden
-          if ($process.ExitCode -ne 0) { throw "Installer exited $($process.ExitCode)" }
-          node desktop/tests/smoke.mjs "$installDir/mosh-desktop.exe" target/release/mosh.exe
       - name: Prepare release files
         shell: pwsh
         run: |
@@ -57,3 +48,12 @@ jobs:
           name: mosh-windows-x64
           path: release/
           if-no-files-found: error
+      - name: Install on a clean runner and exercise the real desktop
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem release/*-setup.exe | Select-Object -First 1
+          if (-not $installer) { throw 'NSIS installer missing' }
+          $installDir = Join-Path $env:RUNNER_TEMP 'MoshSmoke'
+          $process = Start-Process -FilePath $installer.FullName -ArgumentList '/S',"/D=$installDir" -Wait -PassThru -WindowStyle Hidden
+          if ($process.ExitCode -ne 0) { throw "Installer exited $($process.ExitCode)" }
+          node desktop/tests/smoke.mjs "$installDir/mosh-desktop.exe" target/release/mosh.exe
