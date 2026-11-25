@@ -139,3 +139,9 @@ Windows release builds for formats 12 and 13 indexed the same 10,000 generated C
 The labeled cases include paraphrasing, reversed roles, dated evidence, misleading tags, overlapping records, and exact duplicates. A separate actor exercises the inaccessible source. The benchmark treats a correctly empty answer as a correct abstention.
 
 A separate preview trial used SmolLM2 135M Instruct Q4_0 and All-MiniLM 22M in a disposable local Ollama store. On three generated files, a paraphrase that returned no result with inference disabled returned the expected source first by embedding similarity in 823 ms. Indexing used 1,705 reported tokens and the query used 519, including the classifier's attempted plan. The classifier produced zero accepted tags, so this trial measures a semantic retrieval gain only. The models and documents were processed locally.
+
+## Build wizard and live directory changes
+
+`node desktop/tests/smoke.mjs <desktop-executable> <cli-executable>` runs against the Windows desktop WebView. It builds a Mosh using a generated source directory, checks the separate Ledger and the original files, renames a file and its containing folder while the inspector is open, and verifies that deleted results and selections disappear. It also moves and removes the selected root and checks that reopening the Mosh catches changes made while it was inactive.
+
+The Rust tests cover a source notification that arrives before its rename destination, a new file replacing a deleted file at the same path, root relocation and removal, and reopening the workspace catalog. The split-rename test reproduced the identity loss before the fix.

@@ -2344,11 +2344,15 @@ dependencies = [
 name = "mosh-desktop"
 version = "0.2.0-preview.1"
 dependencies = [
+ "anyhow",
+ "dunce",
  "mosh-core",
+ "serde",
  "serde_json",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
+ "tempfile",
 ]
 
 [[package]]

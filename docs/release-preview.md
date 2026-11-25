@@ -20,3 +20,9 @@ Check Windows package hashes against the published `SHA256SUMS.txt`. The preview
 
 - Share the physical parent through the directory record and use one file index for exact-path lookup and directory membership.
 - Count assignments once per tag set and use packed tag postings for search. The separate tag-set owner index is removed.
+
+## Build wizard and live reconciliation in source builds
+
+- Build a Mosh from a directory and switch between its separate Ledger and other local Moshes.
+- Refresh the active Mosh after filesystem changes and whenever it opens. Windows polls directory metadata so monitoring leaves source directories free to rename or delete.
+- Ledger format 14 keeps a sparse native-ID lookup for missing entries. A matching identity can recover tags and Paint when the rename destination arrives after the source has disappeared.

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Archive, ArrowDown, ArrowRight, ArrowUpRight, Clock3, GitBranch, HardDrive, Layers3, Network, Plus, Search, Tags, X } from 'lucide-react'
 import { Empty, ObjectIcon, OpenButton, type Field, type Task } from './App'
 import {
@@ -24,6 +24,8 @@ export function Inspector({ item, generation, refresh, fail, close, show }: {
   const [level, setLevel] = useState('standard')
   const [locked, setLocked] = useState(false)
   const [saved, setSaved] = useState(false)
+  const paintEdit = useRef(0)
+  const paintPersisted = useRef(0)
   const [preview, setPreview] = useState('')
   const [history, setHistory] = useState<Activity[]>([])
   const [commits, setCommits] = useState<Commit[]>([])
@@ -35,7 +37,11 @@ export function Inspector({ item, generation, refresh, fail, close, show }: {
   useEffect(() => {
     let active = true
     ledger<Details>('inspect', { reference }).then((detail) => {
-      if (active) { setDetail(detail); setPaint(detail.paint?.body ?? ''); setLevel(detail.paint?.level ?? 'standard'); setLocked(detail.paint?.locked ?? false) }
+      if (!active) return
+      setDetail(detail)
+      if (paintEdit.current === paintPersisted.current) {
+        setPaint(detail.paint?.body ?? ''); setLevel(detail.paint?.level ?? 'standard'); setLocked(detail.paint?.locked ?? false)
+      }
     }).catch((error) => { if (active) fail(error) })
     return () => { active = false }
   }, [reference, generation])
@@ -50,6 +56,7 @@ export function Inspector({ item, generation, refresh, fail, close, show }: {
   }, [tab, reference, generation, item.git_root])
 
   const object = detail?.object ?? item
+  const editedPaint = () => { paintEdit.current += 1; setSaved(false) }
   const tags = detail?.tags.filter((tag) => tag.name.includes(filter.toLowerCase())) ?? []
   return <aside className="inspector" aria-label="Metadata inspector">
     <div className="inspector-head"><ObjectIcon item={object} /><button className="icon-button" aria-label="Close inspector" onClick={close}><X size={18} /></button></div>
@@ -88,12 +95,18 @@ export function Inspector({ item, generation, refresh, fail, close, show }: {
       </section>
       <section className="inspect-block"><h3>Paint {detail?.paint?.stale && <small>Stale</small>}</h3>
         <form onSubmit={(event) => {
-          event.preventDefault(); ledger('paint', { reference, level, body: paint, locked }).then(() => { setSaved(true); refresh() }).catch(fail)
+          event.preventDefault()
+          const submitted = paintEdit.current
+          ledger('paint', { reference, level, body: paint, locked }).then(() => {
+            paintPersisted.current = submitted
+            setSaved(paintEdit.current === submitted)
+            refresh()
+          }).catch(fail)
         }}>
-          <textarea aria-label="Paint notes" placeholder="Add notes for this object" value={paint} onChange={(event) => { setPaint(event.target.value); setSaved(false) }} />
-          <div className="inline"><select aria-label="Paint level" value={level} onChange={(event) => { setLevel(event.target.value); setSaved(false) }}>
+          <textarea aria-label="Paint notes" placeholder="Add notes for this object" value={paint} onChange={(event) => { setPaint(event.target.value); editedPaint() }} />
+          <div className="inline"><select aria-label="Paint level" value={level} onChange={(event) => { setLevel(event.target.value); editedPaint() }}>
             {['none', 'minimal', 'standard', 'detailed'].map((name) => <option key={name}>{name}</option>)}</select>
-            <label className="check"><input type="checkbox" checked={locked} onChange={(event) => { setLocked(event.target.checked); setSaved(false) }} /> Lock</label>
+            <label className="check"><input type="checkbox" checked={locked} onChange={(event) => { setLocked(event.target.checked); editedPaint() }} /> Lock</label>
             <button className="secondary">Save</button></div>
           {saved && <p className="muted" role="status">Paint saved</p>}
         </form></section>

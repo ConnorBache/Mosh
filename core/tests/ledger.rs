@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use mosh_core::{Action, Mosh, SearchOptions};
 use std::{
     fs,
@@ -720,4 +720,94 @@ fn resolves_an_external_rename_by_native_id_with_destination_permissions() -> Re
     assert!(visitor.get(&id).is_err());
     assert_eq!(fixture.search("direct-tag:keep-my-tag")?, ["moved.txt"]);
     Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+fn split_rename_events_keep_identity_and_deleted_entries_stay_out_of_search() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let original = fixture.root.join("original.txt");
+    let renamed = fixture.root.join("renamed.txt");
+    fs::write(&original, "tracked text")?;
+    fixture.scan()?;
+    let id = fixture.mosh.get(original.to_str().unwrap())?.id;
+    fixture.mosh.tag(&id, "retained-note", true, 1.0)?;
+    let cancel = AtomicBool::new(false);
+
+    fs::rename(&original, &renamed)?;
+    fixture.mosh.refresh_path(&original, &cancel)?;
+    fixture.mosh.refresh_path(&renamed, &cancel)?;
+    assert_eq!(fixture.mosh.get(renamed.to_str().unwrap())?.id, id);
+    assert_eq!(fixture.search("direct-tag:retained-note")?, ["renamed.txt"]);
+
+    fs::remove_file(&renamed)?;
+    fixture.mosh.refresh_path(&renamed, &cancel)?;
+    assert!(fixture.search("direct-tag:retained-note")?.is_empty());
+    assert!(fixture.mosh.get(&id).is_err());
+    fs::write(&renamed, "replacement")?;
+    fixture.mosh.refresh_path(&renamed, &cancel)?;
+    assert_ne!(fixture.mosh.get(renamed.to_str().unwrap())?.id, id);
+    assert!(fixture.search("direct-tag:retained-note")?.is_empty());
+    assert_eq!(fixture.mosh.doctor()?["ok"], true);
+    Ok(())
+}
+
+#[test]
+fn watch_reconciles_a_renamed_and_removed_root() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let child = fixture.root.join("nested");
+    fs::create_dir(&child)?;
+    let file = child.join("track.txt");
+    fs::write(&file, "tracked content")?;
+    fixture.scan()?;
+    let id = fixture.mosh.get(file.to_str().unwrap())?.id;
+    fixture.mosh.tag(&id, "carried-tag", true, 1.0)?;
+    let renamed = fixture.root.with_file_name("moved workspace");
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (send, recv) = mpsc::channel();
+    let watcher = {
+        let db = fixture.db.clone();
+        let root = fixture.root.clone();
+        let cancel = cancel.clone();
+        std::thread::spawn(move || {
+            Mosh::open(&db)?.watch(&root, &cancel, |event| {
+                let _ = send.send(event);
+            })
+        })
+    };
+    let wait = |condition: &dyn Fn() -> Result<bool>| -> Result<()> {
+        let until = Instant::now() + Duration::from_secs(12);
+        while Instant::now() < until {
+            if condition()? {
+                return Ok(());
+            }
+            match recv.recv_timeout(Duration::from_millis(250)) {
+                Ok(event) => {
+                    event?;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        anyhow::bail!("the watched root did not reconcile")
+    };
+    let result = (|| -> Result<()> {
+        recv.recv_timeout(Duration::from_secs(10))??;
+        fs::rename(&fixture.root, &renamed).context("renaming a watched root")?;
+        wait(&|| Ok(fixture.mosh.registered_roots()? == [dunce::canonicalize(&renamed)?]))?;
+        let moved_file = renamed.join("nested/track.txt");
+        assert_eq!(fixture.mosh.get(moved_file.to_str().unwrap())?.id, id);
+        assert_eq!(fixture.search("direct-tag:carried-tag")?, ["track.txt"]);
+        fs::remove_dir_all(&renamed).context("removing a watched root")?;
+        wait(&|| {
+            Ok(fixture.mosh.roots()?.is_empty()
+                && fixture.search("direct-tag:carried-tag")?.is_empty())
+        })?;
+        assert!(fixture.mosh.get(&id).is_err());
+        assert_eq!(fixture.mosh.doctor()?["ok"], true);
+        Ok(())
+    })();
+    cancel.store(true, Ordering::Relaxed);
+    watcher.join().expect("watcher panicked")?;
+    result
 }

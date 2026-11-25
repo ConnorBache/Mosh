@@ -172,7 +172,12 @@ pub(crate) mod win {
             .open(path)
     }
 
-    pub(crate) fn path_by_id(path: &Path, id: &str, birth: i64) -> Option<std::path::PathBuf> {
+    pub(crate) fn path_by_id(
+        path: &Path,
+        id: &str,
+        birth: i64,
+        directory: bool,
+    ) -> Option<std::path::PathBuf> {
         use std::{ffi::OsString, os::windows::ffi::OsStringExt};
         use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 
@@ -201,7 +206,12 @@ pub(crate) mod win {
                     FILE_READ_ATTRIBUTES,
                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                     std::ptr::null(),
-                    FILE_FLAG_OPEN_REPARSE_POINT,
+                    FILE_FLAG_OPEN_REPARSE_POINT
+                        | if directory {
+                            FILE_FLAG_BACKUP_SEMANTICS
+                        } else {
+                            0
+                        },
                 )
             };
             (handle != INVALID_HANDLE_VALUE).then(|| unsafe { File::from_raw_handle(handle) })
@@ -229,8 +239,11 @@ pub(crate) mod win {
         let meta = file.metadata().ok()?;
         if identity.VolumeSerialNumber != volume
             || u128::from_le_bytes(identity.FileId.Identifier) != key
-            || standard.NumberOfLinks != 1
-            || !meta.is_file()
+            || (if directory {
+                !meta.is_dir()
+            } else {
+                !meta.is_file() || standard.NumberOfLinks != 1
+            })
             || reparse(&meta)
             || meta.created().ok().map(millis) != Some(birth)
         {

@@ -186,3 +186,5 @@ summary { cursor: pointer; }
 .intel-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: .8rem; margin: 1rem 0; }
 .intel fieldset { border: 1px solid var(--line); border-radius: 8px; }
 .intel blockquote { margin: 1em 0; padding-left: 1em; border-left: 2px solid; white-space: pre-wrap; }
+.workspace-select { padding: 0 12px 10px; }
+.workspace-select select { width: 100%; min-width: 0; }

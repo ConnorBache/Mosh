@@ -82,6 +82,14 @@ impl Mosh {
         let query = || payload["query"].as_str().unwrap_or("");
         let value = match name {
             "roots" => json!(self.roots()?),
+            "live_objects" => {
+                let ids: Vec<String> = serde_json::from_value(payload["references"].clone())?;
+                json!(
+                    ids.iter()
+                        .filter_map(|id| self.find(id).ok())
+                        .collect::<Vec<_>>()
+                )
+            }
             "search" => {
                 let options = if payload["options"].is_null() {
                     SearchOptions::default()

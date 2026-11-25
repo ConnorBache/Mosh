@@ -39,7 +39,7 @@ pub struct Mosh {
     actor: String,
 }
 
-const LEDGER_VERSION: i64 = 13;
+const LEDGER_VERSION: i64 = 14;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Object {
@@ -266,6 +266,13 @@ impl Mosh {
                     violations == 0,
                     "folder migration found {violations} foreign key violations"
                 );
+            }
+            if current <= 13 {
+                tx.execute_batch(
+                    "CREATE INDEX object_missing_native
+                    ON objects(native_volume,native_ref,created)
+                    WHERE missing=1 AND native_ref IS NOT NULL AND created IS NOT NULL;",
+                )?;
                 tx.pragma_update(None, "user_version", LEDGER_VERSION)?;
             }
             tx.commit()?;
@@ -323,7 +330,7 @@ impl Mosh {
         else {
             return Ok(false);
         };
-        let Some(found) = fsmeta::win::path_by_id(Path::new(path), native, birth) else {
+        let Some(found) = fsmeta::win::path_by_id(Path::new(path), native, birth, false) else {
             return Ok(false);
         };
         let Some(found) = found.to_str().filter(|found| *found != path) else {

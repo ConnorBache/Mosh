@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { spawn, execFileSync } from 'node:child_process'
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -67,7 +67,7 @@ try {
   await page.locator('.sidebar').getByRole('button', { name: 'Sample workspace', exact: true }).click()
   await page.getByRole('heading', { name: 'Sample workspace' }).waitFor()
   if (legacy) {
-    assert.equal(version(db), 11)
+    assert.equal(version(db), 14)
     assert.equal(version(oldDb), 1)
   }
   await page.getByRole('button', { name: 'Orbit.md', exact: true }).click()
@@ -166,7 +166,66 @@ try {
   await page.getByRole('button', { name: 'Search child', exact: true }).click()
   await page.getByText('child-scope.txt', { exact: true }).waitFor()
   assert.equal(call(db, ['search', 'name:child-scope.txt']).length, 0)
-  console.log(`Windows desktop scope, Individuality, and filesystem smoke passed${legacy ? ' on an upgraded format 1 copy' : ''}.`)
+
+  const source = join(fixture, 'Wizard source')
+  const subdirectory = join(source, 'Project files')
+  await mkdir(subdirectory, { recursive: true })
+  const tracked = join(subdirectory, 'Tracked.txt')
+  await writeFile(tracked, 'A source selected in the build wizard.')
+  await page.getByRole('button', { name: 'Build Mosh', exact: true }).click()
+  const wizard = page.getByRole('dialog', { name: 'Build Mosh' })
+  await wizard.getByLabel('Directory', { exact: true }).fill(source)
+  await wizard.getByRole('button', { name: 'Build Mosh', exact: true }).click()
+  await wizard.waitFor({ state: 'hidden' })
+  await page.getByRole('heading', { name: 'Wizard source', exact: true }).waitFor()
+  assert.deepEqual(await readdir(source), ['Project files'])
+  assert.deepEqual(await readdir(subdirectory), ['Tracked.txt'])
+  assert.equal(await readFile(tracked, 'utf8'), 'A source selected in the build wizard.')
+  assert.equal(call(db, ['search', 'name:Tracked.txt']).length, 0)
+  const catalogDirectory = join(fixture, 'ledger.moshes')
+  const catalog = JSON.parse(await readFile(join(catalogDirectory, 'catalog.json'), 'utf8'))
+  assert.equal(catalog.entries[0].id, catalog.active)
+  const wizardDb = join(catalogDirectory, catalog.active + '.sqlite3')
+  assert.equal(call(wizardDb, ['scope', 'info']).mosh, catalog.active)
+  const originalId = call(wizardDb, ['search', 'name:Tracked.txt'])[0].id
+  call(wizardDb, ['tag', 'add', tracked, 'wizard-tag'])
+  await page.getByRole('button', { name: 'Project files', exact: true }).dblclick()
+  await page.getByRole('heading', { name: 'Project files', exact: true }).waitFor()
+  await page.getByRole('button', { name: 'Tracked.txt', exact: true }).click()
+  await inspector.getByText('wizard-tag', { exact: true }).waitFor()
+  const draft = inspector.getByRole('textbox', { name: 'Paint notes' })
+  await draft.fill('Draft while the source is renamed')
+
+  await rename(tracked, join(subdirectory, 'Updated.txt'))
+  await page.getByRole('button', { name: 'Updated.txt', exact: true }).waitFor()
+  await page.getByRole('button', { name: 'Tracked.txt', exact: true }).waitFor({ state: 'hidden' })
+  await inspector.getByRole('heading', { name: 'Updated.txt', exact: true }).waitFor()
+  assert.equal(await draft.inputValue(), 'Draft while the source is renamed')
+  assert.equal(call(wizardDb, ['search', 'direct-tag:wizard-tag'])[0].id, originalId)
+  const moved = join(source, 'Moved project')
+  await rename(subdirectory, moved)
+  await page.getByRole('heading', { name: 'Moved project', exact: true }).waitFor()
+  await rm(join(moved, 'Updated.txt'))
+  await page.getByRole('button', { name: 'Updated.txt', exact: true }).waitFor({ state: 'hidden' })
+  await inspector.waitFor({ state: 'hidden' })
+  assert.deepEqual(call(wizardDb, ['search', 'direct-tag:wizard-tag']), [])
+
+  const movedRoot = join(fixture, 'Wizard source renamed')
+  await rename(source, movedRoot)
+  await page.locator('.sidebar').getByRole('button', { name: 'Wizard source renamed', exact: true }).waitFor()
+  assert.equal(JSON.parse(await readFile(join(catalogDirectory, 'catalog.json'), 'utf8')).entries[0].root.toLowerCase(), movedRoot.toLowerCase())
+  await rm(movedRoot, { recursive: true })
+  await page.getByText('Mosh folder unavailable', { exact: true }).waitFor()
+  assert.deepEqual(call(wizardDb, ['search', '']), [])
+  assert.equal(call(wizardDb, ['doctor']).ok, true)
+  await page.getByRole('combobox', { name: 'Active Mosh' }).selectOption('')
+  await page.locator('.sidebar').getByRole('button', { name: 'Sample workspace', exact: true }).waitFor()
+  await mkdir(movedRoot)
+  await writeFile(join(movedRoot, 'Added while closed.txt'), 'A new file in the recreated directory.')
+  await page.getByRole('combobox', { name: 'Active Mosh' }).selectOption(catalog.active)
+  await page.getByRole('button', { name: 'Added while closed.txt', exact: true }).waitFor()
+  assert.equal(call(wizardDb, ['search', 'direct-tag:wizard-tag']).length, 0)
+  console.log(`Windows desktop build wizard, live filesystem updates, and existing workspace flows passed${legacy ? ' on an upgraded format 1 copy' : ''}.`)
 } finally {
   await browser?.close().catch(() => {})
   if (app?.exitCode === null && app.pid && app.signalCode === null) {

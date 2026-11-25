@@ -6,14 +6,16 @@ Mosh is a local-first file explorer and searchable Ledger for Windows. It indexe
 
 Download the Windows x64 installer or CLI ZIP from [GitHub Releases](https://github.com/ConnorBache/Mosh/releases). The desktop application uses Microsoft Edge WebView2. The initial installer is unsigned. Compare its SHA-256 hash with the release checksum before running it.
 
-The published 0.2.0 preview uses Ledger format 8. Builds from this source tree use format 13 and upgrade earlier Ledgers on open. Back up your Ledger before upgrading. After upgrade, run `mosh ledger compact` to reclaim reusable pages. See the [preview release notes](docs/release-preview.md).
+The published 0.2.0 preview uses Ledger format 8. Builds from this source tree use format 14 and upgrade earlier Ledgers on open. Back up your Ledger before upgrading. After upgrade, run `mosh ledger compact` to reclaim reusable pages. See the [preview release notes](docs/release-preview.md).
 
-1. Open **Mosh** and choose **Index folder**. Select an ordinary directory.
+1. Open **Mosh**, choose **Build Mosh**, and select a directory. Mosh builds a separate local Ledger for that directory and leaves the source files in place.
 2. Browse the indexed folder. Double-click a folder to enter it or a file to open it with its Windows association. Select a row to inspect metadata, a text preview, tags, Paint, and available history.
 3. Search using a filename fragment or a query such as `tag:source-code AND modified:<30d`. Open **Tags** to build a filter or **Collections** to create a virtual Coll or Marriage.
 4. Use **Cleave** to preview a selection. Physical operations require confirmation. Quarantine and undo retain recoverable file bytes.
 
-The desktop and CLI share the Ledger at `%LOCALAPPDATA%\Mosh\ledger.sqlite3`. The `MOSH_DB` environment variable selects another Ledger. This is useful for a disposable workspace.
+Use the **Active Mosh** selector to switch between built directories and the **Default Ledger**. The active Mosh reconciles filesystem changes while open and checks for changes when reopened. Renames preserve file identity when the filesystem provides a matching native ID and creation time. Deleted entries disappear from active views, and their annotations and history stay in the Ledger.
+
+The default desktop and CLI Ledger lives at `%LOCALAPPDATA%\Mosh\ledger.sqlite3`. The `MOSH_DB` environment variable selects a different default Ledger. Moshes built in the wizard live beside it in the `ledger.moshes` folder. Use `mosh --db <path>` to address one of those Ledgers directly.
 
 ## CLI
 
@@ -108,7 +110,7 @@ The following workflow prepares a recoverable quarantine. Substitute the plan ID
 
 If an operation is interrupted, inspect `cleave --status PLAN-ID` and `doctor`. An intent state means a filesystem change may have occurred. Keep both paths and compare their contents with the journal digest before manual recovery. Quarantine files live in `.mosh-quarantine` under a registered root. Mosh excludes this directory from scans.
 
-Use `mosh backup C:\Backups\mosh.sqlite3` for a consistent metadata snapshot. Use `mosh restore C:\Backups\mosh.sqlite3 C:\Recovered\mosh.sqlite3` to restore into a new Ledger. Check it with `mosh --db C:\Recovered\mosh.sqlite3 doctor`. `mosh ledger rebuild` regenerates the metadata search index and packed reverse tag lookups. Back up original files separately. A fresh scan can rediscover files, while annotations, virtual organization, identities, and previously observed activity require the Ledger backup.
+Use `mosh backup C:\Backups\mosh.sqlite3` for a consistent metadata snapshot. Use `mosh restore C:\Backups\mosh.sqlite3 C:\Recovered\mosh.sqlite3` to restore into a new Ledger. Check it with `mosh --db C:\Recovered\mosh.sqlite3 doctor`. `mosh ledger rebuild` regenerates packed reverse tag lookups. Back up original files separately. A fresh scan can rediscover files, while annotations, virtual organization, identities, and previously observed activity require the Ledger backup.
 
 ## Local integration API
 
