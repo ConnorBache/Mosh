@@ -82,6 +82,8 @@ Run `cargo test --locked --release storage_churn_workload -- --ignored --nocaptu
 
 These are small generated workloads. The kernel benchmark remains available for source-tree comparison.
 
+A separate fixed-cost measurement scanned 10,000 generated 4,096-byte C files, arranged in 200 components with 50 files per component and a shared `subsystem` directory within each component. With filesystem tags, compaction left 6,193,152 Ledger bytes for 40,960,000 source bytes, or **619 bytes per file** and **15.1%** of source size. The scan took 12.76 s. File rows and key maps used 292 bytes per file. Their absolute path text alone accounted for 141 raw bytes per file. Directory-key path reconstruction remains a measurable opportunity. The preview retains full paths for indexed path filters and native operations.
+
 ## Preview retrieval evaluation
 
 `cargo test --locked --release --test retrieval_quality -- --nocapture` evaluates 38 generated files and tracks tuned and held-out questions separately. The one tuned miss moved to rank one. On six held-out queries, top-1 accuracy, recall@3, and MRR each rose from **0.50 to 1.00**. Mean held-out latency rose from **1.65 to 2.06 ms**. The compacted database occupied **385,024 bytes**, or **10,132 bytes per file**, before and after within this small fixture's page allocation. The trial spent zero model tokens. A separate test rejects an improvement to the primary query when it demotes a known result in a control query.
