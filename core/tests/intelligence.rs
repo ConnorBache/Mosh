@@ -287,6 +287,7 @@ fn structured_model_output_adds_only_grounded_tags_and_respects_tier_paint() -> 
                 Err(error) => return Err(error.into()),
             }
         };
+        stream.set_nonblocking(false)?;
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
         let mut reader = BufReader::new(&mut stream);
         let mut line = String::new();
@@ -329,11 +330,9 @@ fn structured_model_output_adds_only_grounded_tags_and_respects_tier_paint() -> 
     f.mosh.configure_tiers(&tiers, &Weights::default())?;
     f.scan()?;
     let id = f.indexed(&path)?;
-    assert_eq!(
-        f.mosh.run_agents(1, &AtomicBool::new(false))?["completed"],
-        1
-    );
+    let run = f.mosh.run_agents(1, &AtomicBool::new(false))?;
     server.join().expect("mock local inference server")?;
+    assert_eq!(run["completed"], 1, "{:?}", f.mosh.ai_queue(1)?);
     let assessed = f.mosh.file_tier(&id)?;
     assert_eq!(assessed["assessor"], "ai");
     assert_eq!(assessed["target"], 3);

@@ -125,7 +125,7 @@ export function Ask({ fail, reveal }: { fail: Fail; reveal: (item: LedgerObject)
       {result.notes.map(note => <p className="muted" key={note}>{note}</p>)}
       {result.results.map(item => <article className="inspect-block" key={item.object.id}>
         <button className="secondary" onClick={() => reveal(item.object)}>{item.object.name}</button>
-        <p className="muted">{item.certainty === 'verified-excerpt' ? 'Verified source excerpt' : 'Candidate'} · {item.why.join(' · ')}</p>
+        <p className="muted">{item.certainty === 'verified-excerpt' ? 'Verified source excerpt' : item.certainty === 'approximate' ? 'Approximate match' : 'Candidate'} · {item.why.join(' · ')}</p>
         {item.excerpt && <blockquote>{item.excerpt}</blockquote>}
         {result.id !== null && <div className="inline">
           <button className="secondary" onClick={() => record(item.object.id, true, item.citation?.id)}>Helpful</button>

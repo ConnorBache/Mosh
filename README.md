@@ -41,6 +41,8 @@ Files have separate importance, information, and hotness scores. The default dir
 
 Use **Agents** to queue indexing, run jobs, and inspect their status and model usage. Ask Mosh can return scoped citations, and you can point it to a relevant file if a search misses. It replays that search after indexing and reports whether the confirmed file moved up.
 
+When a planned tag intersection misses, Ask Mosh retries with one fewer inferred tag at a time, starting with tags that entered the registry most recently. It retains positive tag filters you supplied explicitly and labels retry results as approximate. Each retry still needs a search constraint.
+
 ~~~powershell
 .mosh.exe intelligence tier_settings
 .mosh.exe intelligence model_status

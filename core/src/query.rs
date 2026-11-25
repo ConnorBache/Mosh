@@ -98,6 +98,32 @@ fn tokenize(query: &str) -> Result<Vec<Token>> {
     Ok(tokens)
 }
 
+pub(crate) fn explicit_tag_terms(input: &str) -> (Vec<(String, String)>, bool) {
+    let Ok(tokens) = tokenize(input) else {
+        return (Vec::new(), false);
+    };
+    let composite = tokens
+        .iter()
+        .any(|token| matches!(token, Token::Or | Token::Not));
+    let terms = tokens
+        .into_iter()
+        .filter_map(|token| {
+            let Token::Term(term) = token else {
+                return None;
+            };
+            let (field, value) = term.split_once(':')?;
+            if !matches!(
+                field,
+                "tag" | "direct-tag" | "inherited-tag" | "suggested-tag"
+            ) {
+                return None;
+            }
+            Some((field.to_owned(), tag_name(value).ok()?))
+        })
+        .collect();
+    (terms, composite)
+}
+
 struct Parser {
     tokens: std::vec::IntoIter<Token>,
     next: Option<Token>,
@@ -189,6 +215,7 @@ impl Parser {
                     format!("({readable} AND o.id IN({direct}))")
                 }
             }
+            "id" => format!("o.id={}", self.bind(value.to_owned())),
             "name" => format!("o.name={} COLLATE NOCASE", self.bind(value.to_owned())),
             "name-contains" => format!(
                 "instr(lower(o.name),lower({}))>0",

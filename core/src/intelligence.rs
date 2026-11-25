@@ -201,6 +201,38 @@ fn similarity(left: &[u8], right: &[u8]) -> f32 {
 }
 
 impl Mosh {
+    fn tag_relaxation_order(
+        &self,
+        branch: &Branch,
+        protected: &BTreeSet<String>,
+    ) -> Result<Vec<String>> {
+        let mut removable = Vec::new();
+        let mut lookup = self
+            .db
+            .prepare_cached("SELECT created,id FROM tag_registry WHERE id=?")?;
+        for tag in &branch.tags {
+            let name = organization::tag_name(tag)?;
+            if protected.contains(&name) {
+                continue;
+            }
+            let age = match organization::tag_id(&self.db, &name)? {
+                Some(id) => lookup
+                    .query_row([id], |row| {
+                        Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, i64>(1)?))
+                    })
+                    .optional()?,
+                None => None,
+            };
+            removable.push((
+                age.and_then(|(created, _)| created),
+                age.map(|(_, id)| id),
+                name,
+            ));
+        }
+        removable.sort_unstable_by(|a, b| b.cmp(a));
+        Ok(removable.into_iter().map(|(_, _, name)| name).collect())
+    }
+
     pub fn queue_index(&self, query: &str, limit: usize, force: bool) -> Result<Value> {
         self.admin()?;
         let selected = self.search(
@@ -740,6 +772,75 @@ impl Mosh {
     }
 }
 
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn retry_removes_inferred_tags_newest_first_and_stops_at_a_match() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().join("source");
+        fs::create_dir(&root)?;
+        let expected = root.join("review.txt");
+        let unrelated = root.join("notes.md");
+        fs::write(&expected, "Read the quarterly review.")?;
+        fs::write(&unrelated, "Different type of file.")?;
+        let ledger = Mosh::open(&temporary.path().join("ledger.sqlite3"))?;
+        ledger.scan(&root, &AtomicBool::new(false))?;
+        let id = ledger.get(expected.to_str().unwrap())?.id;
+        let other = ledger.get(unrelated.to_str().unwrap())?.id;
+        for (tag, created) in [("baseline", 100), ("middle", 200), ("latest", 300)] {
+            ledger.maintain_tag(tag, "create", None, None, None)?;
+            ledger.db.execute(
+                "UPDATE tag_registry SET created=? WHERE canonical=?",
+                params![created, tag],
+            )?;
+        }
+        ledger.tag(&id, "baseline", true, 1.0)?;
+        ledger.tag(&other, "baseline", true, 1.0)?;
+        let plan = Plan {
+            branches: vec![Branch {
+                tags: vec!["middle".into(), "baseline".into(), "latest".into()],
+                extension: Some("txt".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let cfg = Config {
+            learn: false,
+            ..Default::default()
+        };
+        let run =
+            |request| ledger.retrieve(request, &plan, &cfg, Instant::now(), None, false, None);
+        let miss = run("Find the deliverable")?;
+        assert_eq!(miss["relaxed_tags"], json!(["latest", "middle"]));
+        assert_eq!(miss["results"].as_array().unwrap().len(), 1);
+        assert_eq!(miss["results"][0]["object"]["id"], id);
+        assert_eq!(miss["results"][0]["certainty"], "approximate");
+        assert_eq!(
+            ledger.tag_registry(Some("latest"), 1)?[0]["stored_confirmed_assignments"],
+            0
+        );
+        assert!(
+            run("Find the deliverable with direct-tag:latest")?["results"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        ledger.tag(&id, "middle", true, 1.0)?;
+        assert_eq!(
+            run("Find the deliverable")?["relaxed_tags"],
+            json!(["latest"])
+        );
+        ledger.tag(&id, "latest", true, 1.0)?;
+        let exact = run("Find the deliverable")?;
+        assert_eq!(exact["relaxed_tags"], json!([]));
+        assert_eq!(exact["results"][0]["object"]["id"], id);
+        Ok(())
+    }
+}
+
 fn passes_as_deterministic(name: &str, events: &[(passages::Draft, bool)]) -> bool {
     events.iter().any(|(event, deterministic)| {
         *deterministic && passages::event_tags(event).iter().any(|tag| tag == name)
@@ -786,6 +887,14 @@ fn lexical(input: &str) -> String {
         .map(|word| format!("name-contains:{word} OR paint:{word}"))
         .collect::<Vec<_>>()
         .join(" OR ")
+}
+
+fn require_tags(query: String, required: &str) -> String {
+    match (query.is_empty(), required.is_empty()) {
+        (true, _) => required.to_owned(),
+        (_, true) => query,
+        _ => format!("({query}) AND ({required})"),
+    }
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -1120,6 +1229,18 @@ impl Mosh {
             || plan.after.is_some()
             || plan.before.is_some();
         let mut notes = note.into_iter().collect::<Vec<_>>();
+        let (explicit, composite) = crate::query::explicit_tag_terms(input);
+        let protected = explicit
+            .iter()
+            .map(|(_, name)| name.clone())
+            .collect::<BTreeSet<_>>();
+        let required = explicit
+            .iter()
+            .filter(|_| !composite)
+            .map(|(field, name)| Ok(format!("{field}:{}", query_value(name)?)))
+            .collect::<Result<Vec<_>>>()?
+            .join(" AND ");
+        let mut relaxed = Vec::new();
         let db_start = Instant::now();
         if relation || plan.topic.is_some() {
             for (id, passage) in
@@ -1136,7 +1257,7 @@ impl Mosh {
             if started.elapsed().as_millis() > u128::from(cfg.latency_ms) {
                 break;
             }
-            let query = branch.query()?;
+            let query = require_tags(branch.query()?, &required);
             if query.is_empty() && branch.coll.is_none() {
                 continue;
             }
@@ -1153,7 +1274,9 @@ impl Mosh {
                 }
             };
             for item in matched {
-                if relation && !candidates.contains_key(&item.id) {
+                if (relation && !candidates.contains_key(&item.id))
+                    || !self.permits(&item, "content")?
+                {
                     continue;
                 }
                 let entry = candidates.entry(item.id).or_default();
@@ -1161,8 +1284,61 @@ impl Mosh {
                 entry.1.insert(query.clone());
             }
         }
+        if candidates.is_empty() && !relation && !composite {
+            'paths: for branch in &plan.branches {
+                let mut retry = branch.clone();
+                let mut dropped = Vec::new();
+                for tag in self.tag_relaxation_order(branch, &protected)? {
+                    if started.elapsed().as_millis() > u128::from(cfg.latency_ms) {
+                        break 'paths;
+                    }
+                    retry.tags.retain(|value| {
+                        organization::tag_name(value).as_deref().ok() != Some(tag.as_str())
+                    });
+                    dropped.push(tag);
+                    let query = require_tags(retry.query()?, &required);
+                    if query.is_empty() && retry.coll.is_none() {
+                        break;
+                    }
+                    let matched = match self.search(
+                        &query,
+                        &SearchOptions {
+                            limit: cfg.max_candidates,
+                            parent: retry.coll.clone(),
+                            ..Default::default()
+                        },
+                    ) {
+                        Ok(matched) => matched,
+                        Err(_) => break,
+                    };
+                    for item in matched {
+                        if self.permits(&item, "content")? {
+                            candidates.insert(
+                                item.id,
+                                (
+                                    25,
+                                    BTreeSet::from([
+                                        query.clone(),
+                                        "newest-first tag retry".into(),
+                                    ]),
+                                    None,
+                                ),
+                            );
+                        }
+                    }
+                    if !candidates.is_empty() {
+                        relaxed = dropped;
+                        notes.push(format!(
+                            "Approximate match after relaxing inferred tags in this order: {}.",
+                            relaxed.join(", ")
+                        ));
+                        break 'paths;
+                    }
+                }
+            }
+        }
         if !relation {
-            let query = lexical(input);
+            let query = require_tags(lexical(input), &required);
             if !query.is_empty() && started.elapsed().as_millis() <= u128::from(cfg.latency_ms) {
                 for item in self.search(
                     &query,
@@ -1180,7 +1356,10 @@ impl Mosh {
                 && candidates.len() < cfg.max_candidates
                 && let Some(topic) = &plan.topic
             {
-                let query = format!("indexed-content:{}", query_value(topic)?);
+                let query = require_tags(
+                    format!("indexed-content:{}", query_value(topic)?),
+                    &required,
+                );
                 for item in self.search(
                     &query,
                     &SearchOptions {
@@ -1225,6 +1404,19 @@ impl Mosh {
             if !self.permits(&object, "content")? {
                 continue;
             }
+            if !required.is_empty()
+                && self
+                    .search(
+                        &format!("id:{} AND ({required})", query_value(&id)?),
+                        &SearchOptions {
+                            limit: 1,
+                            ..Default::default()
+                        },
+                    )?
+                    .is_empty()
+            {
+                continue;
+            }
             let source = if passage.is_some() || (answer && rows.len() < 3) {
                 inspected += usize::from(object.kind == "file");
                 content::preview(&object)
@@ -1245,7 +1437,7 @@ impl Mosh {
                 .or_else(|| (!source.is_empty()).then(|| models::clipped(&source, 320)));
             rows.push(
                 json!({"object":object,"why":reasons,"citation":citation,"excerpt":excerpt,
-                "certainty":if citation.is_some() {"verified-excerpt"} else {"candidate"}}),
+                "certainty":if citation.is_some() {"verified-excerpt"} else if reasons.contains("newest-first tag retry") {"approximate"} else {"candidate"}}),
             );
         }
         let read_ms = reading.elapsed().as_millis();
@@ -1293,7 +1485,7 @@ impl Mosh {
             None
         };
         Ok(
-            json!({"id":log,"plan":plan,"results":rows,"answer":composed,"metrics":metrics,"notes":notes}),
+            json!({"id":log,"plan":plan,"results":rows,"answer":composed,"metrics":metrics,"notes":notes,"relaxed_tags":relaxed}),
         )
     }
 
